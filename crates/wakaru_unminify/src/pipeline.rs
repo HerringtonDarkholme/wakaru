@@ -78,7 +78,7 @@ fn run_ast_transformations(
 ) -> Result<String> {
     let allocator = Allocator::default();
     let ret = parse_program(&allocator, source)?;
-    let mut parsed_source = ParsedSourceFile::new(source, ret.program);
+    let mut parsed_source = ParsedSourceFile::new(source, &allocator, ret.program);
 
     for descriptor in descriptors {
         timing.measure(source.filename(), descriptor.id, || {

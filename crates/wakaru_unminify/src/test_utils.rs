@@ -22,7 +22,7 @@ pub(crate) fn define_ast_inline_test(transform: AstTransformationFn) -> impl Fn(
         let source = SourceFile::from_parts(PathBuf::from("test.js"), input);
         let allocator = Allocator::default();
         let ret = parse_program(&allocator, &source).expect("input should parse");
-        let mut parsed_source = ParsedSourceFile::new(&source, ret.program);
+        let mut parsed_source = ParsedSourceFile::new(&source, &allocator, ret.program);
 
         transform(&mut parsed_source).expect("transform should succeed");
 

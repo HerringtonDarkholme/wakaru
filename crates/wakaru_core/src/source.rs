@@ -50,12 +50,17 @@ pub struct ParseSummary {
 
 pub struct ParsedSourceFile<'a> {
     pub source: &'a SourceFile,
+    pub allocator: &'a Allocator,
     pub program: Program<'a>,
 }
 
 impl<'a> ParsedSourceFile<'a> {
-    pub fn new(source: &'a SourceFile, program: Program<'a>) -> Self {
-        Self { source, program }
+    pub fn new(source: &'a SourceFile, allocator: &'a Allocator, program: Program<'a>) -> Self {
+        Self {
+            source,
+            allocator,
+            program,
+        }
     }
 }
 
