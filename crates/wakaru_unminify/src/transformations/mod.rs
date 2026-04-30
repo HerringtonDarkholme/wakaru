@@ -75,7 +75,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-type-constructor", un_type_constructor::transform_ast),
     TransformationDescriptor::ast("un-builtin-prototype", un_builtin_prototype::transform_ast),
     TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
-    TransformationDescriptor::ast("un-flip-comparisons", pending_ast_transform),
+    TransformationDescriptor::ast("un-flip-comparisons", un_flip_comparisons::transform_ast),
     TransformationDescriptor::ast("un-iife", pending_ast_transform),
     TransformationDescriptor::ast("un-import-rename", pending_ast_transform),
     TransformationDescriptor::ast("smart-inline", pending_ast_transform),
