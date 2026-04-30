@@ -41,52 +41,62 @@ pub mod un_use_strict;
 pub mod un_variable_merging;
 pub mod un_while_loop;
 
+use wakaru_core::diagnostics::Result;
 use wakaru_core::rules::TransformationDescriptor;
+use wakaru_core::source::{ParsedSourceFile, SourceFile};
 
 pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
-    TransformationDescriptor::string("oxfmt"),
-    TransformationDescriptor::ast("module-mapping"),
-    TransformationDescriptor::ast("un-curly-braces"),
-    TransformationDescriptor::ast("un-sequence-expression"),
-    TransformationDescriptor::ast("un-variable-merging"),
-    TransformationDescriptor::ast("un-assignment-merging"),
-    TransformationDescriptor::ast("un-runtime-helper"),
-    TransformationDescriptor::ast("un-esm"),
-    TransformationDescriptor::ast("un-enum"),
-    TransformationDescriptor::string("lebab"),
-    TransformationDescriptor::ast("un-export-rename"),
-    TransformationDescriptor::ast("un-use-strict"),
-    TransformationDescriptor::ast("un-esmodule-flag"),
-    TransformationDescriptor::ast("un-boolean"),
-    TransformationDescriptor::ast("un-undefined"),
-    TransformationDescriptor::ast("un-infinity"),
-    TransformationDescriptor::ast("un-typeof"),
-    TransformationDescriptor::ast("un-numeric-literal"),
-    TransformationDescriptor::ast("un-template-literal"),
-    TransformationDescriptor::ast("un-bracket-notation"),
-    TransformationDescriptor::ast("un-return"),
-    TransformationDescriptor::ast("un-while-loop"),
-    TransformationDescriptor::ast("un-indirect-call"),
-    TransformationDescriptor::ast("un-type-constructor"),
-    TransformationDescriptor::ast("un-builtin-prototype"),
-    TransformationDescriptor::ast("un-sequence-expression"),
-    TransformationDescriptor::ast("un-flip-comparisons"),
-    TransformationDescriptor::ast("un-iife"),
-    TransformationDescriptor::ast("un-import-rename"),
-    TransformationDescriptor::ast("smart-inline"),
-    TransformationDescriptor::ast("smart-rename"),
-    TransformationDescriptor::ast("un-optional-chaining"),
-    TransformationDescriptor::ast("un-nullish-coalescing"),
-    TransformationDescriptor::ast("un-conditionals"),
-    TransformationDescriptor::ast("un-sequence-expression"),
-    TransformationDescriptor::ast("un-parameters"),
-    TransformationDescriptor::ast("un-argument-spread"),
-    TransformationDescriptor::ast("un-jsx"),
-    TransformationDescriptor::ast("un-es6-class"),
-    TransformationDescriptor::ast("un-async-await"),
-    TransformationDescriptor::string("oxfmt-1"),
+    TransformationDescriptor::string("oxfmt", oxfmt::transform),
+    TransformationDescriptor::ast("module-mapping", pending_ast_transform),
+    TransformationDescriptor::ast("un-curly-braces", pending_ast_transform),
+    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast("un-variable-merging", pending_ast_transform),
+    TransformationDescriptor::ast("un-assignment-merging", pending_ast_transform),
+    TransformationDescriptor::ast("un-runtime-helper", pending_ast_transform),
+    TransformationDescriptor::ast("un-esm", pending_ast_transform),
+    TransformationDescriptor::ast("un-enum", pending_ast_transform),
+    TransformationDescriptor::string("lebab", pending_string_transform),
+    TransformationDescriptor::ast("un-export-rename", pending_ast_transform),
+    TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast),
+    TransformationDescriptor::ast("un-esmodule-flag", un_esmodule_flag::transform_ast),
+    TransformationDescriptor::ast("un-boolean", pending_ast_transform),
+    TransformationDescriptor::ast("un-undefined", pending_ast_transform),
+    TransformationDescriptor::ast("un-infinity", pending_ast_transform),
+    TransformationDescriptor::ast("un-typeof", pending_ast_transform),
+    TransformationDescriptor::ast("un-numeric-literal", pending_ast_transform),
+    TransformationDescriptor::ast("un-template-literal", pending_ast_transform),
+    TransformationDescriptor::ast("un-bracket-notation", pending_ast_transform),
+    TransformationDescriptor::ast("un-return", pending_ast_transform),
+    TransformationDescriptor::ast("un-while-loop", pending_ast_transform),
+    TransformationDescriptor::ast("un-indirect-call", pending_ast_transform),
+    TransformationDescriptor::ast("un-type-constructor", pending_ast_transform),
+    TransformationDescriptor::ast("un-builtin-prototype", pending_ast_transform),
+    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast("un-flip-comparisons", pending_ast_transform),
+    TransformationDescriptor::ast("un-iife", pending_ast_transform),
+    TransformationDescriptor::ast("un-import-rename", pending_ast_transform),
+    TransformationDescriptor::ast("smart-inline", pending_ast_transform),
+    TransformationDescriptor::ast("smart-rename", pending_ast_transform),
+    TransformationDescriptor::ast("un-optional-chaining", pending_ast_transform),
+    TransformationDescriptor::ast("un-nullish-coalescing", pending_ast_transform),
+    TransformationDescriptor::ast("un-conditionals", pending_ast_transform),
+    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast("un-parameters", pending_ast_transform),
+    TransformationDescriptor::ast("un-argument-spread", pending_ast_transform),
+    TransformationDescriptor::ast("un-jsx", pending_ast_transform),
+    TransformationDescriptor::ast("un-es6-class", pending_ast_transform),
+    TransformationDescriptor::ast("un-async-await", pending_ast_transform),
+    TransformationDescriptor::string("oxfmt-1", oxfmt::transform),
 ];
 
 pub fn default_transformation_registry() -> &'static [TransformationDescriptor] {
     DEFAULT_TRANSFORMATION_REGISTRY
+}
+
+fn pending_ast_transform(_source: &mut ParsedSourceFile) -> Result<()> {
+    Ok(())
+}
+
+fn pending_string_transform(source: &SourceFile) -> Result<String> {
+    Ok(source.code.clone())
 }

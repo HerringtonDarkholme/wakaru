@@ -1,56 +1,35 @@
-use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, CallExpression,
-    Expression, ExpressionStatement, UnaryOperator,
+    Expression, ExpressionStatement, Statement, UnaryOperator,
 };
-use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
-use oxc_span::{SourceType, Span};
-use wakaru_core::diagnostics::{Diagnostic, Result, WakaruError};
-use wakaru_core::source::SourceFile;
+use oxc_ast_visit::{walk_mut, VisitMut};
+use wakaru_core::diagnostics::Result;
+use wakaru_core::source::ParsedSourceFile;
 
-pub fn transform(source: &SourceFile) -> Result<String> {
-    let source_type = SourceType::from_path(&source.path)
-        .unwrap_or_else(|_| SourceType::default().with_jsx(true));
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, &source.code, source_type).parse();
+pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
+    EsModuleFlagRemover.visit_program(&mut source.program);
+    Ok(())
+}
 
-    if !ret.errors.is_empty() || ret.panicked {
-        let diagnostics = ret
-            .errors
-            .into_iter()
-            .map(|err| Diagnostic::error(format!("{err:?}")).with_path(source.path.clone()))
-            .collect();
+struct EsModuleFlagRemover;
 
-        return Err(WakaruError::with_diagnostics(
-            format!("failed to parse {}", source.path.display()),
-            diagnostics,
-        ));
+impl<'a> VisitMut<'a> for EsModuleFlagRemover {
+    fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        statements.retain(|statement| !is_esmodule_flag_statement(statement));
+        walk_mut::walk_statements(self, statements);
     }
-
-    let mut collector = EsModuleFlagCollector::default();
-    collector.visit_program(&ret.program);
-
-    Ok(remove_statements(&source.code, &collector.spans))
 }
 
-#[derive(Default)]
-struct EsModuleFlagCollector {
-    spans: Vec<Span>,
-}
-
-impl<'a> Visit<'a> for EsModuleFlagCollector {
-    fn visit_expression_statement(&mut self, statement: &ExpressionStatement<'a>) {
-        if is_esmodule_flag_statement(statement) {
-            self.spans.push(statement.span);
-            return;
+fn is_esmodule_flag_statement(statement: &Statement) -> bool {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            is_esmodule_flag_expression_statement(statement)
         }
-
-        walk::walk_expression_statement(self, statement);
+        _ => false,
     }
 }
 
-fn is_esmodule_flag_statement(statement: &ExpressionStatement) -> bool {
+fn is_esmodule_flag_expression_statement(statement: &ExpressionStatement) -> bool {
     match &statement.expression {
         Expression::CallExpression(call) => is_define_property_call(call),
         Expression::AssignmentExpression(assignment) => is_esmodule_flag_assignment(assignment),
@@ -139,70 +118,14 @@ fn is_loose_true(expression: &Expression) -> bool {
     }
 }
 
-fn remove_statements(source: &str, spans: &[Span]) -> String {
-    if spans.is_empty() {
-        return source.to_string();
-    }
-
-    let mut ranges = spans
-        .iter()
-        .map(|span| removal_range(source, span))
-        .collect::<Vec<_>>();
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-
-    let mut output = String::with_capacity(source.len());
-    let mut cursor = 0;
-
-    for (start, end) in ranges {
-        if start < cursor {
-            continue;
-        }
-
-        output.push_str(&source[cursor..start]);
-        cursor = end;
-    }
-
-    output.push_str(&source[cursor..]);
-    output
-}
-
-fn removal_range(source: &str, span: &Span) -> (usize, usize) {
-    let mut start = span.start as usize;
-    let mut end = span.end as usize;
-    let bytes = source.as_bytes();
-
-    while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
-        start -= 1;
-    }
-
-    while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
-        end += 1;
-    }
-
-    if end < bytes.len() && bytes[end] == b';' {
-        end += 1;
-        while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
-            end += 1;
-        }
-    }
-
-    if end + 1 < bytes.len() && bytes[end] == b'\r' && bytes[end + 1] == b'\n' {
-        end += 2;
-    } else if end < bytes.len() && matches!(bytes[end], b'\n' | b'\r') {
-        end += 1;
-    }
-
-    (start, end)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::define_inline_test;
+    use crate::test_utils::define_ast_inline_test;
 
     #[test]
     fn removes_es5_define_property_flags() {
-        let inline_test = define_inline_test(transform);
+        let inline_test = define_ast_inline_test(transform_ast);
 
         inline_test(
             r#"
@@ -220,7 +143,7 @@ Object.defineProperty(module.exports, "__esModule", {
 
     #[test]
     fn removes_es3_assignment_flags() {
-        let inline_test = define_inline_test(transform);
+        let inline_test = define_ast_inline_test(transform_ast);
 
         inline_test(
             r#"
@@ -238,7 +161,7 @@ module.exports["__esModule"] = true;
 
     #[test]
     fn leaves_similar_non_flags() {
-        let inline_test = define_inline_test(transform);
+        let inline_test = define_ast_inline_test(transform_ast);
 
         inline_test(
             r#"

@@ -1,9 +1,13 @@
+use oxc_allocator::Allocator;
+use oxc_ast::ast::Program;
+use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::{Diagnostic, Result};
 use wakaru_core::module::{ModuleMapping, ModuleMetaMap};
-use wakaru_core::source::{parse_source, SourceFile};
+use wakaru_core::rules::TransformationDescriptor;
+use wakaru_core::source::{parse_program, parse_source, ParsedSourceFile, SourceFile};
 use wakaru_core::timing::Timing;
 
-use crate::transformations::{oxfmt, un_esmodule_flag, un_use_strict};
+use crate::transformations::default_transformation_registry;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PipelineParams {
@@ -27,19 +31,33 @@ pub fn run_default_transformations(
     let _ = params;
 
     timing.measure(source.filename(), "oxc-parse", || parse_source(source))?;
-    let formatted_code = timing.measure(source.filename(), "oxfmt", || oxfmt::transform(source))?;
-    let formatted_source = SourceFile::from_parts(source.path.clone(), formatted_code);
-    let code = timing.measure(source.filename(), "un-use-strict", || {
-        un_use_strict::transform(&formatted_source)
-    })?;
-    let transformed_source = SourceFile::from_parts(source.path.clone(), code);
-    let code = timing.measure(source.filename(), "un-esmodule-flag", || {
-        un_esmodule_flag::transform(&transformed_source)
-    })?;
-    let transformed_source = SourceFile::from_parts(source.path.clone(), code);
-    let code = timing.measure(source.filename(), "oxfmt-1", || {
-        oxfmt::transform(&transformed_source)
-    })?;
+
+    let mut current = source.clone();
+    let registry = default_transformation_registry();
+    let mut index = 0;
+
+    while index < registry.len() {
+        let descriptor = registry[index];
+
+        if descriptor.kind.is_ast() {
+            let start = index;
+            index += 1;
+            while index < registry.len() && registry[index].kind.is_ast() {
+                index += 1;
+            }
+
+            let code = run_ast_transformations(&current, &registry[start..index], &mut timing)?;
+            current = SourceFile::from_parts(source.path.clone(), code);
+        } else {
+            let code = timing.measure(source.filename(), descriptor.id, || {
+                descriptor.run_string(&current)
+            })?;
+            current = SourceFile::from_parts(source.path.clone(), code);
+            index += 1;
+        }
+    }
+
+    let code = current.code;
     let transformed_source = SourceFile::from_parts(source.path.clone(), code.clone());
     timing.measure(source.filename(), "oxc-parse-output", || {
         parse_source(&transformed_source)
@@ -51,6 +69,34 @@ pub fn run_default_transformations(
         diagnostics: Vec::new(),
         timing,
     })
+}
+
+fn run_ast_transformations(
+    source: &SourceFile,
+    descriptors: &[TransformationDescriptor],
+    timing: &mut Timing,
+) -> Result<String> {
+    let allocator = Allocator::default();
+    let ret = parse_program(&allocator, source)?;
+    let mut parsed_source = ParsedSourceFile::new(source, ret.program);
+
+    for descriptor in descriptors {
+        timing.measure(source.filename(), descriptor.id, || {
+            descriptor.run_ast(&mut parsed_source)
+        })?;
+    }
+
+    Ok(generate_code(&parsed_source.program))
+}
+
+fn generate_code(program: &Program) -> String {
+    let options = CodegenOptions {
+        indent_char: IndentChar::Space,
+        indent_width: 2,
+        ..CodegenOptions::default()
+    };
+
+    Codegen::new().with_options(options).build(program).code
 }
 
 #[cfg(test)]
@@ -77,14 +123,14 @@ mod tests {
                 .iter()
                 .map(|stat| stat.key.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "oxc-parse",
-                "oxfmt",
-                "un-use-strict",
-                "un-esmodule-flag",
-                "oxfmt-1",
-                "oxc-parse-output"
-            ]
+            std::iter::once("oxc-parse")
+                .chain(
+                    default_transformation_registry()
+                        .iter()
+                        .map(|descriptor| descriptor.id)
+                )
+                .chain(std::iter::once("oxc-parse-output"))
+                .collect::<Vec<_>>()
         );
     }
 

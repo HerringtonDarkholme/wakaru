@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_ast::ast::Program;
+use oxc_parser::{Parser, ParserReturn};
 use oxc_span::SourceType;
 
 use crate::diagnostics::{Diagnostic, Result, WakaruError};
@@ -47,11 +48,32 @@ pub struct ParseSummary {
     pub module_record_count: usize,
 }
 
+pub struct ParsedSourceFile<'a> {
+    pub source: &'a SourceFile,
+    pub program: Program<'a>,
+}
+
+impl<'a> ParsedSourceFile<'a> {
+    pub fn new(source: &'a SourceFile, program: Program<'a>) -> Self {
+        Self { source, program }
+    }
+}
+
 pub fn parse_source(source: &SourceFile) -> Result<ParseSummary> {
-    let source_type = SourceType::from_path(&source.path)
-        .unwrap_or_else(|_| SourceType::default().with_jsx(true));
     let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, &source.code, source_type).parse();
+    let ret = parse_program(&allocator, source)?;
+
+    Ok(ParseSummary {
+        statement_count: ret.program.body.len(),
+        module_record_count: ret.module_record.requested_modules.len(),
+    })
+}
+
+pub fn parse_program<'a>(
+    allocator: &'a Allocator,
+    source: &'a SourceFile,
+) -> Result<ParserReturn<'a>> {
+    let ret = Parser::new(allocator, &source.code, source_type_for_path(&source.path)).parse();
 
     if !ret.errors.is_empty() || ret.panicked {
         let diagnostics = ret
@@ -66,8 +88,9 @@ pub fn parse_source(source: &SourceFile) -> Result<ParseSummary> {
         ));
     }
 
-    Ok(ParseSummary {
-        statement_count: ret.program.body.len(),
-        module_record_count: ret.module_record.requested_modules.len(),
-    })
+    Ok(ret)
+}
+
+pub fn source_type_for_path(path: &Path) -> SourceType {
+    SourceType::from_path(path).unwrap_or_else(|_| SourceType::default().with_jsx(true))
 }
