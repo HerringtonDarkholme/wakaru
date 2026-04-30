@@ -14,5 +14,6 @@ use wakaru_core::source::ParsedSourceFile;
 
 pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     array_like_to_array::transform_ast(source)?;
-    array_without_holes::transform_ast(source)
+    array_without_holes::transform_ast(source)?;
+    to_consumable_array::transform_ast(source)
 }
