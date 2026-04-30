@@ -49,7 +49,10 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::string("oxfmt", oxfmt::transform_preserving_raw),
     TransformationDescriptor::ast("module-mapping", module_mapping::transform_ast),
     TransformationDescriptor::ast("un-curly-braces", un_curly_braces::transform_ast),
-    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast(
+        "un-sequence-expression",
+        un_sequence_expression::transform_ast,
+    ),
     TransformationDescriptor::ast("un-variable-merging", un_variable_merging::transform_ast),
     TransformationDescriptor::ast(
         "un-assignment-merging",
@@ -74,7 +77,10 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-indirect-call", pending_ast_transform),
     TransformationDescriptor::ast("un-type-constructor", un_type_constructor::transform_ast),
     TransformationDescriptor::ast("un-builtin-prototype", un_builtin_prototype::transform_ast),
-    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast(
+        "un-sequence-expression",
+        un_sequence_expression::transform_ast,
+    ),
     TransformationDescriptor::ast("un-flip-comparisons", un_flip_comparisons::transform_ast),
     TransformationDescriptor::ast("un-iife", pending_ast_transform),
     TransformationDescriptor::ast("un-import-rename", pending_ast_transform),
@@ -83,7 +89,10 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-optional-chaining", pending_ast_transform),
     TransformationDescriptor::ast("un-nullish-coalescing", pending_ast_transform),
     TransformationDescriptor::ast("un-conditionals", pending_ast_transform),
-    TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
+    TransformationDescriptor::ast(
+        "un-sequence-expression",
+        un_sequence_expression::transform_ast,
+    ),
     TransformationDescriptor::ast("un-parameters", pending_ast_transform),
     TransformationDescriptor::ast("un-argument-spread", pending_ast_transform),
     TransformationDescriptor::ast("un-jsx", pending_ast_transform),
