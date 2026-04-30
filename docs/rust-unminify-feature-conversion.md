@@ -210,7 +210,7 @@ This list records the audited migration order for the default `packages/unminify
 | 12 | `un-return` | done | AST mutate pass simplifying direct final function/method returns: removes `return`, `return undefined`, and `return void 0`; converts `return void expr` to `expr;`; wired. |
 | 13 | `un-numeric-literal` | done | AST mutate pass normalizing numeric literal spelling and preserving original raw value comments through the parsed-source synthetic trailing comment side channel; wired. |
 | 14 | `un-template-literal` | done | AST mutate pass converting string `.concat` chains to real Oxc template literals; wired. |
-| 15 | `un-type-constructor` | `AST mutate` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
+| 15 | `un-type-constructor` | done | AST mutate pass restoring `Number`, `String`, and sparse `Array` constructor shapes; wired. |
 | 16 | `un-builtin-prototype` | `AST mutate` | Restore built-in prototype method calls. |
 | 17 | `un-flip-comparisons` | `AST mutate` | Normalize comparisons; important before `un-parameters`. |
 | 18 | `un-sequence-expression` | `AST mutate` | Split sequence expressions across statements; preserve duplicate registry passes. |
