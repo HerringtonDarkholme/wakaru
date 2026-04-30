@@ -62,7 +62,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-esm", pending_ast_transform),
     TransformationDescriptor::ast("un-enum", pending_ast_transform),
     TransformationDescriptor::ast("lebab", pending_ast_transform),
-    TransformationDescriptor::ast("un-export-rename", pending_ast_transform),
+    TransformationDescriptor::ast("un-export-rename", un_export_rename::transform_ast),
     TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast),
     TransformationDescriptor::ast("un-esmodule-flag", un_esmodule_flag::transform_ast),
     TransformationDescriptor::ast("un-boolean", un_boolean::transform_ast),

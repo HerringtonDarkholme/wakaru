@@ -214,8 +214,8 @@ This list records the audited migration order for the default `packages/unminify
 | 16 | `un-builtin-prototype` | done | AST mutate pass restoring literal receiver `.call`/`.apply` chains to built-in prototype method calls; wired. |
 | 17 | `un-flip-comparisons` | done | AST mutate pass reversing Yoda-style equality and relational comparisons when the left side is a simple constant/common value; wired. |
 | 18 | `un-sequence-expression` | done | AST mutate pass splitting sequence expressions across statement-list contexts, including expression statements, returns, control-flow tests, variable declarations, and loop headers; wired for all duplicate registry occurrences. |
-| 19 | `lebab` | `Deferred compatibility` | Rebuild an Oxc-native subset under one `lebab` pass instead of binding to JS Lebab. |
-| 20 | `un-export-rename` | `Semantic transform` | Merge declarations with named exports and rename safely. |
+| 19 | `lebab` | pending | Intentionally skipped for now. Keep the mirrored no-op AST registry entry until an Oxc-native compatibility subset is designed. |
+| 20 | `un-export-rename` | done | Semantic transform merging top-level declaration aliases into named exports; uses Oxc symbol/reference IDs so recursive references are renamed while shadowed bindings are preserved; wired. |
 | 21 | `un-import-rename` | `Semantic transform` | Rename aliased import locals safely. |
 | 22 | `un-undefined` | `Semantic transform` | Convert numeric `void` expressions only when `undefined` is not locally declared. |
 | 23 | Babel helper core | `Pipeline/composite` | Port helper passes used by `un-runtime-helper`: array-like, array-without-holes, to-consumable-array, sliced-to-array, extends, object-spread, create-for-of. |

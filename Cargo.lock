@@ -952,6 +952,7 @@ dependencies = [
  "oxc_ast_visit",
  "oxc_codegen",
  "oxc_parser",
+ "oxc_semantic",
  "oxc_span",
  "oxc_syntax",
  "wakaru_core",
