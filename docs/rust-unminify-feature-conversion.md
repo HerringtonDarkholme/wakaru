@@ -157,6 +157,58 @@ Before marking a feature converted:
 - Scope-sensitive rewrites use semantic data or are documented as intentionally limited.
 - The CLI smoke test demonstrates the transform if it is wired into the default pipeline.
 
+## Ordered Migration Log
+
+This list records the audited migration order for the default `packages/unminify` registry. Keep the Rust registry mirrored in `crates/wakaru_unminify/src/transformations/mod.rs`, but port features in this order so small, verifiable passes land before transforms that need shared semantic infrastructure.
+
+| Order | Transform | Path | Notes |
+| ---: | --- | --- | --- |
+| 0 | `oxfmt` | done | Replacement for JS formatter passes; already wired as `oxfmt` and `oxfmt-1`. |
+| 1 | `un-use-strict` | done | First real Rust transform; already wired. |
+| 2 | `un-esmodule-flag` | `Span edit` | Remove CJS `__esModule` boilerplate; small and registry-adjacent. |
+| 3 | `un-boolean` | `AST mutate + codegen` | Convert `!0` and `!1`; tiny low-risk pass. |
+| 4 | `un-infinity` | `AST mutate + codegen` | Convert `1 / 0` and `-1 / 0`; tiny low-risk pass. |
+| 5 | `un-typeof` | `AST mutate + codegen` | Expand `typeof x < "u"` and mirrored comparisons. |
+| 6 | `un-bracket-notation` | `AST mutate + codegen` | Simplify string computed members to dot or numeric members. |
+| 7 | `un-while-loop` | `AST mutate + codegen` | Convert `for (; test; )` and `for (;;)` to `while`. |
+| 8 | `un-assignment-merging` | `AST mutate + codegen` | Split chained assignments into multiple statements. |
+| 9 | `un-variable-merging` | `Semantic transform` | Split multi-declarator statements; needed before stronger module rewrites. |
+| 10 | `module-mapping` | `AST mutate + codegen` | Replace mapped numeric/string `require` ids; requires pipeline params. |
+| 11 | `un-curly-braces` | `AST mutate + codegen` | Add blocks around control-flow bodies; broad syntax surface. |
+| 12 | `un-return` | `AST mutate + codegen` | Remove redundant final returns and convert `return void expr`. |
+| 13 | `un-numeric-literal` | `AST mutate + codegen` | Normalize numeric literal spelling and preserve original raw value comments. |
+| 14 | `un-template-literal` | `AST mutate + codegen` | Convert `.concat` string chains to template literals. |
+| 15 | `un-type-constructor` | `AST mutate + codegen` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
+| 16 | `un-builtin-prototype` | `AST mutate + codegen` | Restore built-in prototype method calls. |
+| 17 | `un-flip-comparisons` | `AST mutate + codegen` | Normalize comparisons; important before `un-parameters`. |
+| 18 | `un-sequence-expression` | `AST mutate + codegen` | Split sequence expressions across statements; preserve duplicate registry passes. |
+| 19 | `lebab` | `Deferred compatibility` | Rebuild an Oxc-native subset under one `lebab` pass instead of binding to JS Lebab. |
+| 20 | `un-export-rename` | `Semantic transform` | Merge declarations with named exports and rename safely. |
+| 21 | `un-import-rename` | `Semantic transform` | Rename aliased import locals safely. |
+| 22 | `un-undefined` | `Semantic transform` | Convert numeric `void` expressions only when `undefined` is not locally declared. |
+| 23 | Babel helper core | `Pipeline/composite` | Port helper passes used by `un-runtime-helper`: array-like, array-without-holes, to-consumable-array, sliced-to-array, extends, object-spread, create-for-of. |
+| 24 | `un-runtime-helper` | `Pipeline/composite` | Add helper annotations and run the Babel helper core. |
+| 25 | Babel interop helpers | `Semantic transform` | Port `interopRequireDefault` and `interopRequireWildcard`; required by `un-esm`. |
+| 26 | `un-esm` | `Semantic transform` | Convert CJS import/export shapes, dedupe imports, handle hoist option and missing require comments. |
+| 27 | `un-enum` | `Semantic transform` | Reconstruct TypeScript enum objects from IIFE output. |
+| 28 | `un-indirect-call` | `Semantic transform` | Convert `(0, mod.fn)()` and update imports or destructuring. |
+| 29 | `un-iife` | `Semantic transform` | Rename short IIFE params and move literal args into locals. |
+| 30 | `smart-rename` | `Semantic transform` | Heuristic destructuring and React identifier renames. |
+| 31 | `smart-inline` | `Semantic transform` | Destructuring and temp variable inline heuristics. |
+| 32 | `un-optional-chaining` | `Semantic transform` | Decision-tree based optional chaining reconstruction. |
+| 33 | `un-nullish-coalescing` | `Semantic transform` | Decision-tree based nullish coalescing reconstruction. |
+| 34 | `un-conditionals` | `Semantic transform` | Convert ternary/logical trees to `if`/`switch`; run after optional/nullish passes. |
+| 35 | `un-default-parameter` | `Semantic transform` | Restore default and positional parameters from function body patterns. |
+| 36 | `un-parameter-rest` | `Semantic transform` | Convert safe `arguments` references to `...args`. |
+| 37 | `un-parameters` | `Pipeline/composite` | Keep public registry entry as one descriptor that runs default and rest parameter passes. |
+| 38 | `un-argument-spread` | `AST mutate + codegen` | Convert safe `.apply` calls to spread arguments. |
+| 39 | `un-jsx` | `Semantic transform` | Convert React classic and automatic runtime calls to JSX. |
+| 40 | `un-es6-class` | `Semantic transform` | Rebuild classes from constructor/prototype/static/getter/setter/extends shapes. |
+| 41 | `un-async-await` | `Semantic transform` | Reconstruct TypeScript `__generator` and `__awaiter`; control-flow heavy, migrate last. |
+| 42 | `oxfmt-1` | done | Final formatting pass. |
+
+`un-builtins` is intentionally not in this migration queue because it is not in the default TS registry and the TS implementation is a TODO stub. Keep its Rust skeleton for traceability, but do not wire it into the default pipeline until the feature exists upstream or a Rust-specific design is accepted.
+
 ## Example: `un-use-strict`
 
 `un-use-strict` is the first real Rust transform.
