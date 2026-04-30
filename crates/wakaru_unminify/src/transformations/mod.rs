@@ -67,7 +67,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-infinity", un_infinity::transform_ast),
     TransformationDescriptor::ast("un-typeof", un_typeof::transform_ast),
     TransformationDescriptor::ast("un-numeric-literal", un_numeric_literal::transform_ast),
-    TransformationDescriptor::ast("un-template-literal", pending_ast_transform),
+    TransformationDescriptor::ast("un-template-literal", un_template_literal::transform_ast),
     TransformationDescriptor::ast("un-bracket-notation", un_bracket_notation::transform_ast),
     TransformationDescriptor::ast("un-return", un_return::transform_ast),
     TransformationDescriptor::ast("un-while-loop", un_while_loop::transform_ast),
