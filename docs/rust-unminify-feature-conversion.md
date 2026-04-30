@@ -216,7 +216,7 @@ This list records the audited migration order for the default `packages/unminify
 | 18 | `un-sequence-expression` | done | AST mutate pass splitting sequence expressions across statement-list contexts, including expression statements, returns, control-flow tests, variable declarations, and loop headers; wired for all duplicate registry occurrences. |
 | 19 | `lebab` | pending | Intentionally skipped for now. Keep the mirrored no-op AST registry entry until an Oxc-native compatibility subset is designed. |
 | 20 | `un-export-rename` | done | Semantic transform merging top-level declaration aliases into named exports; uses Oxc symbol/reference IDs so recursive references are renamed while shadowed bindings are preserved; wired. |
-| 21 | `un-import-rename` | `Semantic transform` | Rename aliased import locals safely. |
+| 21 | `un-import-rename` | done | Semantic transform renaming import aliases back to imported names, with sequential conflict suffixes and symbol/reference-safe use-site updates; wired. |
 | 22 | `un-undefined` | `Semantic transform` | Convert numeric `void` expressions only when `undefined` is not locally declared. |
 | 23 | Babel helper core | `Pipeline/composite` | Port helper passes used by `un-runtime-helper`: array-like, array-without-holes, to-consumable-array, sliced-to-array, extends, object-spread, create-for-of. |
 | 24 | `un-runtime-helper` | `Pipeline/composite` | Add helper annotations and run the Babel helper core. |
