@@ -58,7 +58,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
         "un-assignment-merging",
         un_assignment_merging::transform_ast,
     ),
-    TransformationDescriptor::ast("un-runtime-helper", pending_ast_transform),
+    TransformationDescriptor::ast("un-runtime-helper", un_runtime_helper::transform_ast),
     TransformationDescriptor::ast("un-esm", pending_ast_transform),
     TransformationDescriptor::ast("un-enum", pending_ast_transform),
     TransformationDescriptor::ast("lebab", pending_ast_transform),
