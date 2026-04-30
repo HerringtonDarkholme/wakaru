@@ -66,7 +66,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast),
     TransformationDescriptor::ast("un-esmodule-flag", un_esmodule_flag::transform_ast),
     TransformationDescriptor::ast("un-boolean", un_boolean::transform_ast),
-    TransformationDescriptor::ast("un-undefined", pending_ast_transform),
+    TransformationDescriptor::ast("un-undefined", un_undefined::transform_ast),
     TransformationDescriptor::ast("un-infinity", un_infinity::transform_ast),
     TransformationDescriptor::ast("un-typeof", un_typeof::transform_ast),
     TransformationDescriptor::ast("un-numeric-literal", un_numeric_literal::transform_ast),
