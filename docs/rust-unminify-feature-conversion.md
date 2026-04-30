@@ -171,6 +171,8 @@ Expected shape:
 - Consecutive `Ast` registry entries are grouped. The pipeline parses the current source once into `ParsedSourceFile`, runs every AST transform in that group against the same mutable Oxc `Program`, then prints once with Oxc codegen.
 - Another `String` entry starts a new source boundary. Any following AST group reparses from that string output.
 - The pipeline still parses the final output for validation.
+- AST transforms that need synthetic trailing comments, currently `un-numeric-literal`, record them on `ParsedSourceFile`; the pipeline applies those replacements after all registered transformations so final formatting cannot erase them.
+- Pending deferred string passes should not force a source boundary until they have a real Rust implementation. For now `lebab` remains in the mirrored registry as a no-op AST descriptor so earlier raw syntax metadata survives for later migrated passes.
 
 This means AST transforms should not parse source themselves in the default path and should not recreate `SourceFile`. Standalone unit tests use `define_ast_inline_test` to provide the parsed source and codegen step.
 
@@ -206,7 +208,7 @@ This list records the audited migration order for the default `packages/unminify
 | 10 | `module-mapping` | done | AST mutate pass replacing mapped numeric/string `require` ids from pipeline params; wired. |
 | 11 | `un-curly-braces` | done | AST mutate pass adding blocks around control-flow bodies, arrow expression bodies, and switch case consequents while preserving direct `var` declaration bodies; wired. |
 | 12 | `un-return` | done | AST mutate pass simplifying direct final function/method returns: removes `return`, `return undefined`, and `return void 0`; converts `return void expr` to `expr;`; wired. |
-| 13 | `un-numeric-literal` | `AST mutate` | Normalize numeric literal spelling and preserve original raw value comments. |
+| 13 | `un-numeric-literal` | done | AST mutate pass normalizing numeric literal spelling and preserving original raw value comments through the parsed-source synthetic trailing comment side channel; wired. |
 | 14 | `un-template-literal` | `AST mutate` | Convert `.concat` string chains to template literals. |
 | 15 | `un-type-constructor` | `AST mutate` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
 | 16 | `un-builtin-prototype` | `AST mutate` | Restore built-in prototype method calls. |

@@ -4,7 +4,9 @@ use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::rules::AstTransformationFn;
-use wakaru_core::source::{parse_program, ParsedSourceFile, SourceFile, TransformationParams};
+use wakaru_core::source::{
+    parse_program, ParsedSourceFile, SourceFile, SyntheticTrailingComment, TransformationParams,
+};
 
 pub(crate) fn define_inline_test(
     transform: fn(&SourceFile) -> Result<String>,
@@ -35,9 +37,47 @@ pub(crate) fn define_ast_inline_test(transform: AstTransformationFn) -> impl Fn(
             })
             .build(&parsed_source.program)
             .code;
+        let output =
+            apply_synthetic_trailing_comments(output, &parsed_source.synthetic_trailing_comments);
 
         assert_eq!(normalize(&output), normalize(expected));
     }
+}
+
+fn apply_synthetic_trailing_comments(
+    mut code: String,
+    comments: &[SyntheticTrailingComment],
+) -> String {
+    let mut search_start = 0;
+
+    for comment in comments {
+        let Some((relative_index, candidate)) =
+            find_first_candidate(&code[search_start..], comment)
+        else {
+            continue;
+        };
+
+        let start = search_start + relative_index;
+        let end = start + candidate.len();
+        code.replace_range(start..end, &comment.replacement);
+        search_start = start + comment.replacement.len();
+    }
+
+    code
+}
+
+fn find_first_candidate<'a>(
+    code: &str,
+    comment: &'a SyntheticTrailingComment,
+) -> Option<(usize, &'a str)> {
+    comment
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            code.find(candidate)
+                .map(|index| (index, candidate.as_str()))
+        })
+        .min_by_key(|(index, _)| *index)
 }
 
 fn normalize(code: &str) -> String {

@@ -3,6 +3,13 @@ use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::{parse_program, SourceFile};
 
+pub fn transform_preserving_raw(source: &SourceFile) -> Result<String> {
+    let allocator = Allocator::default();
+    parse_program(&allocator, source)?;
+
+    Ok(source.code.clone())
+}
+
 pub fn transform(source: &SourceFile) -> Result<String> {
     let allocator = Allocator::default();
     let ret = parse_program(&allocator, source)?;

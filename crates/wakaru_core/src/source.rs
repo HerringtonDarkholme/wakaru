@@ -54,6 +54,7 @@ pub struct ParsedSourceFile<'a> {
     pub allocator: &'a Allocator,
     pub program: Program<'a>,
     pub params: &'a TransformationParams,
+    pub synthetic_trailing_comments: Vec<SyntheticTrailingComment>,
 }
 
 impl<'a> ParsedSourceFile<'a> {
@@ -68,6 +69,7 @@ impl<'a> ParsedSourceFile<'a> {
             allocator,
             program,
             params,
+            synthetic_trailing_comments: Vec::new(),
         }
     }
 }
@@ -76,6 +78,12 @@ impl<'a> ParsedSourceFile<'a> {
 pub struct TransformationParams {
     pub module_mapping: ModuleMapping,
     pub module_meta: ModuleMetaMap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntheticTrailingComment {
+    pub candidates: Vec<String>,
+    pub replacement: String,
 }
 
 pub fn parse_source(source: &SourceFile) -> Result<ParseSummary> {

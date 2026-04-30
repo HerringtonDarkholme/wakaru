@@ -43,10 +43,10 @@ pub mod un_while_loop;
 
 use wakaru_core::diagnostics::Result;
 use wakaru_core::rules::TransformationDescriptor;
-use wakaru_core::source::{ParsedSourceFile, SourceFile};
+use wakaru_core::source::ParsedSourceFile;
 
 pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
-    TransformationDescriptor::string("oxfmt", oxfmt::transform),
+    TransformationDescriptor::string("oxfmt", oxfmt::transform_preserving_raw),
     TransformationDescriptor::ast("module-mapping", module_mapping::transform_ast),
     TransformationDescriptor::ast("un-curly-braces", un_curly_braces::transform_ast),
     TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
@@ -58,7 +58,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-runtime-helper", pending_ast_transform),
     TransformationDescriptor::ast("un-esm", pending_ast_transform),
     TransformationDescriptor::ast("un-enum", pending_ast_transform),
-    TransformationDescriptor::string("lebab", pending_string_transform),
+    TransformationDescriptor::ast("lebab", pending_ast_transform),
     TransformationDescriptor::ast("un-export-rename", pending_ast_transform),
     TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast),
     TransformationDescriptor::ast("un-esmodule-flag", un_esmodule_flag::transform_ast),
@@ -66,7 +66,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-undefined", pending_ast_transform),
     TransformationDescriptor::ast("un-infinity", un_infinity::transform_ast),
     TransformationDescriptor::ast("un-typeof", un_typeof::transform_ast),
-    TransformationDescriptor::ast("un-numeric-literal", pending_ast_transform),
+    TransformationDescriptor::ast("un-numeric-literal", un_numeric_literal::transform_ast),
     TransformationDescriptor::ast("un-template-literal", pending_ast_transform),
     TransformationDescriptor::ast("un-bracket-notation", un_bracket_notation::transform_ast),
     TransformationDescriptor::ast("un-return", un_return::transform_ast),
@@ -98,8 +98,4 @@ pub fn default_transformation_registry() -> &'static [TransformationDescriptor] 
 
 fn pending_ast_transform(_source: &mut ParsedSourceFile) -> Result<()> {
     Ok(())
-}
-
-fn pending_string_transform(source: &SourceFile) -> Result<String> {
-    Ok(source.code.clone())
 }

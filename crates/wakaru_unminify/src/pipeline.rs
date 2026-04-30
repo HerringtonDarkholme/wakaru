@@ -4,7 +4,8 @@ use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::{Diagnostic, Result};
 use wakaru_core::rules::TransformationDescriptor;
 use wakaru_core::source::{
-    parse_program, parse_source, ParsedSourceFile, SourceFile, TransformationParams,
+    parse_program, parse_source, ParsedSourceFile, SourceFile, SyntheticTrailingComment,
+    TransformationParams,
 };
 use wakaru_core::timing::Timing;
 
@@ -28,6 +29,7 @@ pub fn run_default_transformations(
     timing.measure(source.filename(), "oxc-parse", || parse_source(source))?;
 
     let mut current = source.clone();
+    let mut synthetic_trailing_comments = Vec::new();
     let registry = default_transformation_registry();
     let mut index = 0;
 
@@ -41,8 +43,9 @@ pub fn run_default_transformations(
                 index += 1;
             }
 
-            let code =
+            let (code, comments) =
                 run_ast_transformations(&current, &registry[start..index], &params, &mut timing)?;
+            synthetic_trailing_comments.extend(comments);
             current = SourceFile::from_parts(source.path.clone(), code);
         } else {
             let code = timing.measure(source.filename(), descriptor.id, || {
@@ -53,7 +56,7 @@ pub fn run_default_transformations(
         }
     }
 
-    let code = current.code;
+    let code = apply_synthetic_trailing_comments(current.code, &synthetic_trailing_comments);
     let transformed_source = SourceFile::from_parts(source.path.clone(), code.clone());
     timing.measure(source.filename(), "oxc-parse-output", || {
         parse_source(&transformed_source)
@@ -72,7 +75,7 @@ fn run_ast_transformations(
     descriptors: &[TransformationDescriptor],
     params: &PipelineParams,
     timing: &mut Timing,
-) -> Result<String> {
+) -> Result<(String, Vec<SyntheticTrailingComment>)> {
     let allocator = Allocator::default();
     let ret = parse_program(&allocator, source)?;
     let mut parsed_source = ParsedSourceFile::new(source, &allocator, ret.program, params);
@@ -83,7 +86,10 @@ fn run_ast_transformations(
         })?;
     }
 
-    Ok(generate_code(&parsed_source.program))
+    Ok((
+        generate_code(&parsed_source.program),
+        parsed_source.synthetic_trailing_comments,
+    ))
 }
 
 fn generate_code(program: &Program) -> String {
@@ -94,6 +100,42 @@ fn generate_code(program: &Program) -> String {
     };
 
     Codegen::new().with_options(options).build(program).code
+}
+
+fn apply_synthetic_trailing_comments(
+    mut code: String,
+    comments: &[SyntheticTrailingComment],
+) -> String {
+    let mut search_start = 0;
+
+    for comment in comments {
+        let Some((relative_index, candidate)) =
+            find_first_candidate(&code[search_start..], comment)
+        else {
+            continue;
+        };
+
+        let start = search_start + relative_index;
+        let end = start + candidate.len();
+        code.replace_range(start..end, &comment.replacement);
+        search_start = start + comment.replacement.len();
+    }
+
+    code
+}
+
+fn find_first_candidate<'a>(
+    code: &str,
+    comment: &'a SyntheticTrailingComment,
+) -> Option<(usize, &'a str)> {
+    comment
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            code.find(candidate)
+                .map(|index| (index, candidate.as_str()))
+        })
+        .min_by_key(|(index, _)| *index)
 }
 
 #[cfg(test)]
@@ -142,5 +184,19 @@ mod tests {
             .expect("pipeline should succeed");
 
         assert_eq!(result.code, "exports.foo = 1;\n");
+    }
+
+    #[test]
+    fn preserves_numeric_literal_raw_comments_across_formatting_boundaries() {
+        let source =
+            SourceFile::from_parts(PathBuf::from("input.js"), "0b101010;-0x123;4.2e2;-2e4;");
+
+        let result = run_default_transformations(&source, PipelineParams::default())
+            .expect("pipeline should succeed");
+
+        assert_eq!(
+            result.code,
+            "42/* 0b101010 */;\n-291/* -0x123 */;\n420/* 4.2e2 */;\n-20000/* -2e4 */;\n"
+        );
     }
 }
