@@ -219,7 +219,7 @@ This list records the audited migration order for the default `packages/unminify
 | 21 | `un-import-rename` | done | Semantic transform renaming import aliases back to imported names, with sequential conflict suffixes and symbol/reference-safe use-site updates; wired. |
 | 22 | `un-undefined` | done | Semantic transform converting numeric `void` expressions to `undefined` only when Oxc scope lookup confirms `undefined` is not declared in the current scope chain; wired. |
 | 23 | Babel helper core | partial | `array-like`, `array-without-holes`, `to-consumable-array`, `sliced-to-array`, `extends`, `object-spread`, and the direct standard/loose `create-for-of` helper scaffolds ported and wired through the Rust runtime helper composite. Remaining `create-for-of` gap: loop-function body extraction. |
-| 24 | `un-runtime-helper` | partial | Runs the currently ported Babel helper core subset. Helper annotation from module metadata and full `create-for-of` loop-function support are still pending. |
+| 24 | `un-runtime-helper` | partial | Runs the currently ported Babel helper core subset and annotates top-level helper functions from module metadata. Full `create-for-of` loop-function support is still pending. |
 | 25 | Babel interop helpers | `Semantic transform` | Port `interopRequireDefault` and `interopRequireWildcard`; required by `un-esm`. |
 | 26 | `un-esm` | `Semantic transform` | Convert CJS import/export shapes, dedupe imports, handle hoist option and missing require comments. |
 | 27 | `un-enum` | `Semantic transform` | Reconstruct TypeScript enum objects from IIFE output. |
