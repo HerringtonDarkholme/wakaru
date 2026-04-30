@@ -205,7 +205,7 @@ This list records the audited migration order for the default `packages/unminify
 | 9 | `un-variable-merging` | done | AST mutate pass splitting multi-declarator variable declarations and extracting unused `var` declarators from `for` initializers; wired. Parent-scope detection currently mirrors covered TS behavior through direct parent statement declarations and should move to Oxc semantic data before broadening. |
 | 10 | `module-mapping` | done | AST mutate pass replacing mapped numeric/string `require` ids from pipeline params; wired. |
 | 11 | `un-curly-braces` | done | AST mutate pass adding blocks around control-flow bodies, arrow expression bodies, and switch case consequents while preserving direct `var` declaration bodies; wired. |
-| 12 | `un-return` | `AST mutate` | Remove redundant final returns and convert `return void expr`. |
+| 12 | `un-return` | done | AST mutate pass simplifying direct final function/method returns: removes `return`, `return undefined`, and `return void 0`; converts `return void expr` to `expr;`; wired. |
 | 13 | `un-numeric-literal` | `AST mutate` | Normalize numeric literal spelling and preserve original raw value comments. |
 | 14 | `un-template-literal` | `AST mutate` | Convert `.concat` string chains to template literals. |
 | 15 | `un-type-constructor` | `AST mutate` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
