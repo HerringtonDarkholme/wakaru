@@ -3,7 +3,7 @@ use wakaru_core::module::{ModuleMapping, ModuleMetaMap};
 use wakaru_core::source::{parse_source, SourceFile};
 use wakaru_core::timing::Timing;
 
-use crate::transformations::{oxfmt, un_use_strict};
+use crate::transformations::{oxfmt, un_esmodule_flag, un_use_strict};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PipelineParams {
@@ -31,6 +31,10 @@ pub fn run_default_transformations(
     let formatted_source = SourceFile::from_parts(source.path.clone(), formatted_code);
     let code = timing.measure(source.filename(), "un-use-strict", || {
         un_use_strict::transform(&formatted_source)
+    })?;
+    let transformed_source = SourceFile::from_parts(source.path.clone(), code);
+    let code = timing.measure(source.filename(), "un-esmodule-flag", || {
+        un_esmodule_flag::transform(&transformed_source)
     })?;
     let transformed_source = SourceFile::from_parts(source.path.clone(), code);
     let code = timing.measure(source.filename(), "oxfmt-1", || {
@@ -77,9 +81,23 @@ mod tests {
                 "oxc-parse",
                 "oxfmt",
                 "un-use-strict",
+                "un-esmodule-flag",
                 "oxfmt-1",
                 "oxc-parse-output"
             ]
         );
+    }
+
+    #[test]
+    fn removes_esmodule_flag() {
+        let source = SourceFile::from_parts(
+            PathBuf::from("input.js"),
+            "Object.defineProperty(exports,'__esModule',{value:!0});exports.foo=1;",
+        );
+
+        let result = run_default_transformations(&source, PipelineParams::default())
+            .expect("pipeline should succeed");
+
+        assert_eq!(result.code, "exports.foo = 1;\n");
     }
 }
