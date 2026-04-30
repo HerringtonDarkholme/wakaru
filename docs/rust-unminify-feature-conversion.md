@@ -11,7 +11,8 @@ The goal is practical parity: each Rust transformation should be traceable to th
 - Preserve duplicate registry passes, such as repeated `un-sequence-expression`.
 - Treat Babel-generated output as input behavior that still needs support. Do not port Babel parser helpers.
 - Prefer Oxc AST, spans, semantic analysis, and codegen over string matching.
-- Use source-text edits only for small transforms where Oxc spans identify the exact syntax to remove or replace.
+- AST transforms must mutate the parsed Oxc AST in place. Do not return source text from AST transforms.
+- String transforms may parse and reprint internally, but their public transform function returns source text.
 - Add tests before broadening behavior. Keep fixtures readable and close to the TS inline test style.
 
 ## Conversion Workflow
@@ -31,8 +32,8 @@ Read the transform file, its tests, and any imported helpers. Record:
 
 Use one of these paths:
 
-- `Span edit`: Oxc identifies exact source ranges and no reprint is needed.
-- `AST mutate + codegen`: the transform changes tree shape, inserts nodes, or needs formatting.
+- `String transform`: the transform operates on source text and returns a new `String`. It reparses source directly if it needs an AST.
+- `AST mutate`: the transform takes `&mut ParsedSourceFile`, mutates `program` in place, and returns `()`. The pipeline reparses once for a consecutive AST group and codegens once after the group.
 - `Semantic transform`: the transform depends on bindings, references, import/export metadata, or unused declaration removal.
 - `Pipeline/composite`: the feature composes other transforms or requires module metadata.
 - `Deferred compatibility`: the TS feature depends on JS-only tools such as Lebab and needs a Rust replacement plan.
@@ -43,7 +44,9 @@ Start with the behavior covered by existing TS tests. Avoid widening behavior du
 
 4. Add Rust inline tests.
 
-Use `crates/wakaru_unminify/src/test_utils.rs`:
+Use `crates/wakaru_unminify/src/test_utils.rs`.
+
+For string transforms:
 
 ```rust
 let inline_test = define_inline_test(transform);
@@ -58,19 +61,34 @@ expected code
 );
 ```
 
-The helper normalizes CRLF and trims input/output like `packages/test-utils/src/index.ts`.
+For AST transforms:
+
+```rust
+let inline_test = define_ast_inline_test(transform_ast);
+
+inline_test(
+    "
+input code
+",
+    "
+expected code
+",
+);
+```
+
+The helpers normalize CRLF and trim input/output like `packages/test-utils/src/index.ts`. AST transform tests parse once, run the transform against `ParsedSourceFile`, and print with Oxc codegen.
 
 5. Wire the transform.
 
-Keep the module declaration and descriptor name aligned with the TS filename:
+Keep the module declaration and descriptor name aligned with the TS filename. The registry descriptor is the executable registration point:
 
 ```text
 packages/unminify/src/transformations/un-use-strict.ts
 crates/wakaru_unminify/src/transformations/un_use_strict.rs
-TransformationDescriptor::ast("un-use-strict")
+TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast)
 ```
 
-When a transform becomes executable, connect it in `pipeline.rs` at the matching registry position. The current prototype only runs `un-use-strict`; as the runner matures, execution should be driven by the mirrored registry rather than hand-coded calls.
+Do not add id-based dispatch or hand-coded pass order in `pipeline.rs`. `run_default_transformations` iterates `default_transformation_registry()`. To migrate a pass, replace the registry row's pending function with the real transform function.
 
 6. Verify JS/Rust behavior.
 
@@ -84,33 +102,34 @@ For every migrated transform:
 
 ## Implementation Patterns
 
-### Span Edit
+### String Transform
 
-Use this for transforms like `un-use-strict`, where Oxc exposes directive spans and the output can preserve the surrounding source text.
+Use this for formatter/compatibility passes that naturally operate on source text, such as `oxfmt` and the future Oxc-native `lebab` replacement.
 
 Expected shape:
 
-- parse with Oxc
-- collect spans with an Oxc visitor
-- sort ranges
-- remove or replace ranges from source text
-- parse transformed output with Oxc in the pipeline
+- accept `&SourceFile`
+- parse inside the transform if an AST is needed
+- return transformed `String`
+- let the pipeline treat the returned string as a new source boundary
 
 Risks:
 
-- comments can be dropped or moved differently from TS
-- semicolon/newline handling can create accidental token joins
-- overlapping ranges must be sorted and skipped safely
+- every string transform invalidates any previous parsed AST
+- codegen output can differ from Recast formatting
+- comments may need explicit handling if the transform reparses and prints
 
-### AST Mutate + Codegen
+### AST Mutate
 
 Use this for transforms that restructure expressions or statements, such as `un-boolean`, `un-typeof`, `un-bracket-notation`, and many sequence-expression cases.
 
 Expected shape:
 
-- parse with Oxc
-- mutate AST using Oxc allocation rules
-- print with Oxc codegen
+- expose `pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()>`
+- mutate `source.program` using Oxc visitors or direct AST operations
+- allocate new nodes through Oxc allocation rules when inserting syntax
+- return `Ok(())`, not source text
+- let the pipeline codegen once after the consecutive AST group
 - preserve behavior through tests, not byte-for-byte original formatting
 
 Risks:
@@ -144,6 +163,17 @@ Expected shape:
 - call the child Rust transforms internally in the same order as TS
 - keep child files available for traceability if they exist as TS files
 
+## Pipeline Execution Model
+
+`run_default_transformations` is registry-driven:
+
+- `String` registry entries run directly on the current `SourceFile` and return fresh source text.
+- Consecutive `Ast` registry entries are grouped. The pipeline parses the current source once into `ParsedSourceFile`, runs every AST transform in that group against the same mutable Oxc `Program`, then prints once with Oxc codegen.
+- Another `String` entry starts a new source boundary. Any following AST group reparses from that string output.
+- The pipeline still parses the final output for validation.
+
+This means AST transforms should not parse source themselves in the default path and should not recreate `SourceFile`. Standalone unit tests use `define_ast_inline_test` to provide the parsed source and codegen step.
+
 ## Review Checklist
 
 Before marking a feature converted:
@@ -163,25 +193,25 @@ This list records the audited migration order for the default `packages/unminify
 
 | Order | Transform | Path | Notes |
 | ---: | --- | --- | --- |
-| 0 | `oxfmt` | done | Replacement for JS formatter passes; already wired as `oxfmt` and `oxfmt-1`. |
-| 1 | `un-use-strict` | done | First real Rust transform; already wired. |
-| 2 | `un-esmodule-flag` | `Span edit` | Remove CJS `__esModule` boilerplate; small and registry-adjacent. |
-| 3 | `un-boolean` | `AST mutate + codegen` | Convert `!0` and `!1`; tiny low-risk pass. |
-| 4 | `un-infinity` | `AST mutate + codegen` | Convert `1 / 0` and `-1 / 0`; tiny low-risk pass. |
-| 5 | `un-typeof` | `AST mutate + codegen` | Expand `typeof x < "u"` and mirrored comparisons. |
-| 6 | `un-bracket-notation` | `AST mutate + codegen` | Simplify string computed members to dot or numeric members. |
-| 7 | `un-while-loop` | `AST mutate + codegen` | Convert `for (; test; )` and `for (;;)` to `while`. |
-| 8 | `un-assignment-merging` | `AST mutate + codegen` | Split chained assignments into multiple statements. |
+| 0 | `oxfmt` | done | String transform replacement for JS formatter passes; already wired as `oxfmt` and `oxfmt-1`. |
+| 1 | `un-use-strict` | done | AST mutate pass; already wired. |
+| 2 | `un-esmodule-flag` | done | AST mutate pass removing CJS `__esModule` boilerplate; already wired. |
+| 3 | `un-boolean` | `AST mutate` | Convert `!0` and `!1`; tiny low-risk pass. |
+| 4 | `un-infinity` | `AST mutate` | Convert `1 / 0` and `-1 / 0`; tiny low-risk pass. |
+| 5 | `un-typeof` | `AST mutate` | Expand `typeof x < "u"` and mirrored comparisons. |
+| 6 | `un-bracket-notation` | `AST mutate` | Simplify string computed members to dot or numeric members. |
+| 7 | `un-while-loop` | `AST mutate` | Convert `for (; test; )` and `for (;;)` to `while`. |
+| 8 | `un-assignment-merging` | `AST mutate` | Split chained assignments into multiple statements. |
 | 9 | `un-variable-merging` | `Semantic transform` | Split multi-declarator statements; needed before stronger module rewrites. |
-| 10 | `module-mapping` | `AST mutate + codegen` | Replace mapped numeric/string `require` ids; requires pipeline params. |
-| 11 | `un-curly-braces` | `AST mutate + codegen` | Add blocks around control-flow bodies; broad syntax surface. |
-| 12 | `un-return` | `AST mutate + codegen` | Remove redundant final returns and convert `return void expr`. |
-| 13 | `un-numeric-literal` | `AST mutate + codegen` | Normalize numeric literal spelling and preserve original raw value comments. |
-| 14 | `un-template-literal` | `AST mutate + codegen` | Convert `.concat` string chains to template literals. |
-| 15 | `un-type-constructor` | `AST mutate + codegen` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
-| 16 | `un-builtin-prototype` | `AST mutate + codegen` | Restore built-in prototype method calls. |
-| 17 | `un-flip-comparisons` | `AST mutate + codegen` | Normalize comparisons; important before `un-parameters`. |
-| 18 | `un-sequence-expression` | `AST mutate + codegen` | Split sequence expressions across statements; preserve duplicate registry passes. |
+| 10 | `module-mapping` | `AST mutate` | Replace mapped numeric/string `require` ids; requires pipeline params. |
+| 11 | `un-curly-braces` | `AST mutate` | Add blocks around control-flow bodies; broad syntax surface. |
+| 12 | `un-return` | `AST mutate` | Remove redundant final returns and convert `return void expr`. |
+| 13 | `un-numeric-literal` | `AST mutate` | Normalize numeric literal spelling and preserve original raw value comments. |
+| 14 | `un-template-literal` | `AST mutate` | Convert `.concat` string chains to template literals. |
+| 15 | `un-type-constructor` | `AST mutate` | Restore `Number`, `String`, and sparse `Array` constructor shapes. |
+| 16 | `un-builtin-prototype` | `AST mutate` | Restore built-in prototype method calls. |
+| 17 | `un-flip-comparisons` | `AST mutate` | Normalize comparisons; important before `un-parameters`. |
+| 18 | `un-sequence-expression` | `AST mutate` | Split sequence expressions across statements; preserve duplicate registry passes. |
 | 19 | `lebab` | `Deferred compatibility` | Rebuild an Oxc-native subset under one `lebab` pass instead of binding to JS Lebab. |
 | 20 | `un-export-rename` | `Semantic transform` | Merge declarations with named exports and rename safely. |
 | 21 | `un-import-rename` | `Semantic transform` | Rename aliased import locals safely. |
@@ -201,7 +231,7 @@ This list records the audited migration order for the default `packages/unminify
 | 35 | `un-default-parameter` | `Semantic transform` | Restore default and positional parameters from function body patterns. |
 | 36 | `un-parameter-rest` | `Semantic transform` | Convert safe `arguments` references to `...args`. |
 | 37 | `un-parameters` | `Pipeline/composite` | Keep public registry entry as one descriptor that runs default and rest parameter passes. |
-| 38 | `un-argument-spread` | `AST mutate + codegen` | Convert safe `.apply` calls to spread arguments. |
+| 38 | `un-argument-spread` | `AST mutate` | Convert safe `.apply` calls to spread arguments. |
 | 39 | `un-jsx` | `Semantic transform` | Convert React classic and automatic runtime calls to JSX. |
 | 40 | `un-es6-class` | `Semantic transform` | Rebuild classes from constructor/prototype/static/getter/setter/extends shapes. |
 | 41 | `un-async-await` | `Semantic transform` | Reconstruct TypeScript `__generator` and `__awaiter`; control-flow heavy, migrate last. |
@@ -213,20 +243,20 @@ This list records the audited migration order for the default `packages/unminify
 
 `un-use-strict` is the first real Rust transform.
 
-Classification: `Span edit`.
+Classification: `AST mutate`.
 
 Why it is a good first conversion:
 
 - Oxc exposes directives directly through `Program.directives` and `FunctionBody.directives`.
 - The TS behavior is small and covered by readable inline tests.
-- It demonstrates Oxc parsing, AST visiting, source editing, pipeline wiring, test helper usage, and CLI-visible output.
+- It demonstrates Oxc parsing, AST mutation, registry-driven pipeline wiring, test helper usage, and CLI-visible output.
 
 Current behavior:
 
 - removes top-level and function-body `"use strict"` directives
 - preserves non-directive string literals such as `return str === 'use strict'`
-- validates output through the pipeline's Oxc parse step
+- mutates directive lists in place and validates output through the pipeline's Oxc parse step
 
 Known limitation:
 
-- TS explicitly merges comments attached to removed directives onto the next node. The Rust span-edit implementation preserves leading comments that are separate source lines, but it does not yet model attached AST comments. Add comment attachment tests before relying on exact comment relocation parity.
+- TS explicitly merges comments attached to removed directives onto the next node. The Rust AST implementation removes directive nodes and Oxc codegen can drop comments that were attached only to removed directives. Add comment-retargeting support and comment attachment tests before relying on exact comment relocation parity.
