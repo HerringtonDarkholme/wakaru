@@ -12,4 +12,5 @@ oxc_ast_visit = "0.128.0"
 oxc_codegen = "0.128.0"
 oxc_parser = "0.128.0"
 oxc_span = "0.128.0"
+oxc_syntax = "0.128.0"
 wakaru_core.workspace = true

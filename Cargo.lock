@@ -953,6 +953,7 @@ dependencies = [
  "oxc_codegen",
  "oxc_parser",
  "oxc_span",
+ "oxc_syntax",
  "wakaru_core",
 ]
 

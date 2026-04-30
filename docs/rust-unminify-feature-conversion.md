@@ -197,7 +197,7 @@ This list records the audited migration order for the default `packages/unminify
 | 1 | `un-use-strict` | done | AST mutate pass; already wired. |
 | 2 | `un-esmodule-flag` | done | AST mutate pass removing CJS `__esModule` boilerplate; already wired. |
 | 3 | `un-boolean` | done | AST mutate pass converting `!0` and `!1`; already wired. |
-| 4 | `un-infinity` | `AST mutate` | Convert `1 / 0` and `-1 / 0`; tiny low-risk pass. |
+| 4 | `un-infinity` | done | AST mutate pass converting `1 / 0` and `-1 / 0`; already wired. |
 | 5 | `un-typeof` | `AST mutate` | Expand `typeof x < "u"` and mirrored comparisons. |
 | 6 | `un-bracket-notation` | `AST mutate` | Simplify string computed members to dot or numeric members. |
 | 7 | `un-while-loop` | `AST mutate` | Convert `for (; test; )` and `for (;;)` to `while`. |
