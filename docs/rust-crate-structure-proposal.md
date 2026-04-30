@@ -226,7 +226,7 @@ crates/wakaru_unminify/src/
     mod.rs
     lebab.rs
     module_mapping.rs
-    prettier.rs
+    oxfmt.rs
     smart_inline.rs
     smart_rename.rs
     un_argument_spread.rs
@@ -292,7 +292,7 @@ crates/wakaru_unminify/src/
 ```rust
 pub fn default_transformations() -> Vec<Box<dyn Rule>> {
     vec![
-        box_rule(prettier::Prettier::new("prettier")),
+        box_rule(oxfmt::Oxfmt::new("oxfmt")),
         box_rule(module_mapping::ModuleMapping),
         box_rule(un_curly_braces::UnCurlyBraces),
         box_rule(un_sequence_expression::UnSequenceExpression),
@@ -336,14 +336,14 @@ pub fn default_transformations() -> Vec<Box<dyn Rule>> {
         box_rule(un_es6_class::UnEs6Class),
         box_rule(un_async_await::UnAsyncAwait),
 
-        box_rule(prettier::Prettier::new("prettier-1")),
+        box_rule(oxfmt::Oxfmt::new("oxfmt-1")),
     ]
 }
 ```
 
 Notes:
 
-- `prettier.rs` should become an Oxc codegen-backed formatting rule, not a dependency on Prettier.
+- `oxfmt.rs` should be an Oxc formatting rule.
 - `lebab.rs` should probably start as a placeholder or targeted compatibility rule. Do not add a JavaScript runtime dependency for Lebab.
 - `un_parameters.rs` should mirror the current merged rule and compose `un_default_parameter` plus `un_parameter_rest`.
 - `runtime_helpers/babel/*` should be kept because handling Babel output is still required.
@@ -381,7 +381,7 @@ Do not migrate initially:
 - `packages/test-utils` as a package
 - `packages/ds` as a standalone crate
 - old standalone `@wakaru/unpacker` and `@wakaru/unminify` CLIs
-- Prettier and Lebab as runtime dependencies
+- JS formatter packages and Lebab as runtime dependencies
 
 ## Dependency Starting Point
 
@@ -410,4 +410,3 @@ oxc_traverse = "*"
 ```
 
 Pin the Oxc crates to the same published version across the workspace once implementation starts.
-

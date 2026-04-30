@@ -1,6 +1,6 @@
 pub mod lebab;
 pub mod module_mapping;
-pub mod prettier;
+pub mod oxfmt;
 pub mod runtime_helpers;
 pub mod smart_inline;
 pub mod smart_rename;
@@ -44,7 +44,7 @@ pub mod un_while_loop;
 use wakaru_core::rules::TransformationDescriptor;
 
 pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
-    TransformationDescriptor::string("prettier"),
+    TransformationDescriptor::string("oxfmt"),
     TransformationDescriptor::ast("module-mapping"),
     TransformationDescriptor::ast("un-curly-braces"),
     TransformationDescriptor::ast("un-sequence-expression"),
@@ -84,7 +84,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-jsx"),
     TransformationDescriptor::ast("un-es6-class"),
     TransformationDescriptor::ast("un-async-await"),
-    TransformationDescriptor::string("prettier-1"),
+    TransformationDescriptor::string("oxfmt-1"),
 ];
 
 pub fn default_transformation_registry() -> &'static [TransformationDescriptor] {

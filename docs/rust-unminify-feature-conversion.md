@@ -35,7 +35,7 @@ Use one of these paths:
 - `AST mutate + codegen`: the transform changes tree shape, inserts nodes, or needs formatting.
 - `Semantic transform`: the transform depends on bindings, references, import/export metadata, or unused declaration removal.
 - `Pipeline/composite`: the feature composes other transforms or requires module metadata.
-- `Deferred compatibility`: the TS feature depends on JS-only tools such as Prettier or Lebab and needs a Rust replacement plan.
+- `Deferred compatibility`: the TS feature depends on JS-only tools such as Lebab and needs a Rust replacement plan.
 
 3. Port the smallest faithful behavior first.
 
@@ -117,7 +117,7 @@ Risks:
 
 - Oxc arena lifetimes require transform-local allocation discipline
 - comments may need explicit preservation
-- codegen output will differ from Recast/Prettier formatting
+- codegen output will differ from Recast formatting and should be normalized through Oxc formatting support
 
 ### Semantic Transform
 

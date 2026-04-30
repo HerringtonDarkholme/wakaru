@@ -10,7 +10,7 @@ The CLI exposes `all`, `unpacker`/`unpack`, and `unminify`, plus the default int
 
 `packages/unpacker/src/Module.ts` defines the central module data shape: `id`, `isEntry`, `import`, `export`, `tags`, and `code`. `packages/unpacker/src/unpack.ts` parses the bundle, tries webpack then browserify, falls back to a single entry module, reparses extracted modules, scans imports/exports/runtime tags, and returns `{ modules, moduleIdMapping }`.
 
-`packages/unminify/src/transformations/index.ts` defines one ordered registry. The Rust `wakaru_unminify` crate should mirror that order directly, including repeated `un-sequence-expression` passes and the second prettier pass as `prettier-1`.
+`packages/unminify/src/transformations/index.ts` defines one ordered registry. The Rust `wakaru_unminify` crate should mirror that order directly, including repeated `un-sequence-expression` passes. Formatter entries should use Oxc formatting names (`oxfmt` and `oxfmt-1`) rather than the JS formatter name.
 
 `packages/shared/src/runner.ts` keeps either source text or a jscodeshift AST alive to avoid parse/print churn. Rust should eventually model this as pipeline state over Oxc AST/source/codegen, but the first prototype only validates parse and preserves source text.
 
