@@ -40,3 +40,53 @@ pub mod un_undefined;
 pub mod un_use_strict;
 pub mod un_variable_merging;
 pub mod un_while_loop;
+
+use wakaru_core::rules::TransformationDescriptor;
+
+pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
+    TransformationDescriptor::string("prettier"),
+    TransformationDescriptor::ast("module-mapping"),
+    TransformationDescriptor::ast("un-curly-braces"),
+    TransformationDescriptor::ast("un-sequence-expression"),
+    TransformationDescriptor::ast("un-variable-merging"),
+    TransformationDescriptor::ast("un-assignment-merging"),
+    TransformationDescriptor::ast("un-runtime-helper"),
+    TransformationDescriptor::ast("un-esm"),
+    TransformationDescriptor::ast("un-enum"),
+    TransformationDescriptor::string("lebab"),
+    TransformationDescriptor::ast("un-export-rename"),
+    TransformationDescriptor::ast("un-use-strict"),
+    TransformationDescriptor::ast("un-esmodule-flag"),
+    TransformationDescriptor::ast("un-boolean"),
+    TransformationDescriptor::ast("un-undefined"),
+    TransformationDescriptor::ast("un-infinity"),
+    TransformationDescriptor::ast("un-typeof"),
+    TransformationDescriptor::ast("un-numeric-literal"),
+    TransformationDescriptor::ast("un-template-literal"),
+    TransformationDescriptor::ast("un-bracket-notation"),
+    TransformationDescriptor::ast("un-return"),
+    TransformationDescriptor::ast("un-while-loop"),
+    TransformationDescriptor::ast("un-indirect-call"),
+    TransformationDescriptor::ast("un-type-constructor"),
+    TransformationDescriptor::ast("un-builtin-prototype"),
+    TransformationDescriptor::ast("un-sequence-expression"),
+    TransformationDescriptor::ast("un-flip-comparisons"),
+    TransformationDescriptor::ast("un-iife"),
+    TransformationDescriptor::ast("un-import-rename"),
+    TransformationDescriptor::ast("smart-inline"),
+    TransformationDescriptor::ast("smart-rename"),
+    TransformationDescriptor::ast("un-optional-chaining"),
+    TransformationDescriptor::ast("un-nullish-coalescing"),
+    TransformationDescriptor::ast("un-conditionals"),
+    TransformationDescriptor::ast("un-sequence-expression"),
+    TransformationDescriptor::ast("un-parameters"),
+    TransformationDescriptor::ast("un-argument-spread"),
+    TransformationDescriptor::ast("un-jsx"),
+    TransformationDescriptor::ast("un-es6-class"),
+    TransformationDescriptor::ast("un-async-await"),
+    TransformationDescriptor::string("prettier-1"),
+];
+
+pub fn default_transformation_registry() -> &'static [TransformationDescriptor] {
+    DEFAULT_TRANSFORMATION_REGISTRY
+}

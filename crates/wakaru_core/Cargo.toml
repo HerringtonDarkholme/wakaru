@@ -6,3 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+oxc_allocator = "0.128.0"
+oxc_parser = "0.128.0"
+oxc_span = "0.128.0"

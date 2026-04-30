@@ -13,3 +13,6 @@ path = "src/main.rs"
 wakaru_core.workspace = true
 wakaru_unpacker.workspace = true
 wakaru_unminify.workspace = true
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+globwalk = "0.9.1"
