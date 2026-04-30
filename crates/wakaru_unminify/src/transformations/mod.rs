@@ -47,7 +47,7 @@ use wakaru_core::source::{ParsedSourceFile, SourceFile};
 
 pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::string("oxfmt", oxfmt::transform),
-    TransformationDescriptor::ast("module-mapping", pending_ast_transform),
+    TransformationDescriptor::ast("module-mapping", module_mapping::transform_ast),
     TransformationDescriptor::ast("un-curly-braces", pending_ast_transform),
     TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
     TransformationDescriptor::ast("un-variable-merging", un_variable_merging::transform_ast),

@@ -4,7 +4,7 @@ use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::rules::AstTransformationFn;
-use wakaru_core::source::{parse_program, ParsedSourceFile, SourceFile};
+use wakaru_core::source::{parse_program, ParsedSourceFile, SourceFile, TransformationParams};
 
 pub(crate) fn define_inline_test(
     transform: fn(&SourceFile) -> Result<String>,
@@ -22,7 +22,8 @@ pub(crate) fn define_ast_inline_test(transform: AstTransformationFn) -> impl Fn(
         let source = SourceFile::from_parts(PathBuf::from("test.js"), input);
         let allocator = Allocator::default();
         let ret = parse_program(&allocator, &source).expect("input should parse");
-        let mut parsed_source = ParsedSourceFile::new(&source, &allocator, ret.program);
+        let params = TransformationParams::default();
+        let mut parsed_source = ParsedSourceFile::new(&source, &allocator, ret.program, &params);
 
         transform(&mut parsed_source).expect("transform should succeed");
 

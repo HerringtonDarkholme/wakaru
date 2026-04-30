@@ -2,18 +2,15 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;
 use oxc_codegen::{Codegen, CodegenOptions, IndentChar};
 use wakaru_core::diagnostics::{Diagnostic, Result};
-use wakaru_core::module::{ModuleMapping, ModuleMetaMap};
 use wakaru_core::rules::TransformationDescriptor;
-use wakaru_core::source::{parse_program, parse_source, ParsedSourceFile, SourceFile};
+use wakaru_core::source::{
+    parse_program, parse_source, ParsedSourceFile, SourceFile, TransformationParams,
+};
 use wakaru_core::timing::Timing;
 
 use crate::transformations::default_transformation_registry;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PipelineParams {
-    pub module_mapping: ModuleMapping,
-    pub module_meta: ModuleMetaMap,
-}
+pub type PipelineParams = TransformationParams;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransformationResult {
@@ -28,8 +25,6 @@ pub fn run_default_transformations(
     params: PipelineParams,
 ) -> Result<TransformationResult> {
     let mut timing = Timing::default();
-    let _ = params;
-
     timing.measure(source.filename(), "oxc-parse", || parse_source(source))?;
 
     let mut current = source.clone();
@@ -46,7 +41,8 @@ pub fn run_default_transformations(
                 index += 1;
             }
 
-            let code = run_ast_transformations(&current, &registry[start..index], &mut timing)?;
+            let code =
+                run_ast_transformations(&current, &registry[start..index], &params, &mut timing)?;
             current = SourceFile::from_parts(source.path.clone(), code);
         } else {
             let code = timing.measure(source.filename(), descriptor.id, || {
@@ -74,11 +70,12 @@ pub fn run_default_transformations(
 fn run_ast_transformations(
     source: &SourceFile,
     descriptors: &[TransformationDescriptor],
+    params: &PipelineParams,
     timing: &mut Timing,
 ) -> Result<String> {
     let allocator = Allocator::default();
     let ret = parse_program(&allocator, source)?;
-    let mut parsed_source = ParsedSourceFile::new(source, &allocator, ret.program);
+    let mut parsed_source = ParsedSourceFile::new(source, &allocator, ret.program, params);
 
     for descriptor in descriptors {
         timing.measure(source.filename(), descriptor.id, || {

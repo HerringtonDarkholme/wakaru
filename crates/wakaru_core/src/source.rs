@@ -7,6 +7,7 @@ use oxc_parser::{Parser, ParserReturn};
 use oxc_span::SourceType;
 
 use crate::diagnostics::{Diagnostic, Result, WakaruError};
+use crate::module::{ModuleMapping, ModuleMetaMap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceFile {
@@ -52,16 +53,29 @@ pub struct ParsedSourceFile<'a> {
     pub source: &'a SourceFile,
     pub allocator: &'a Allocator,
     pub program: Program<'a>,
+    pub params: &'a TransformationParams,
 }
 
 impl<'a> ParsedSourceFile<'a> {
-    pub fn new(source: &'a SourceFile, allocator: &'a Allocator, program: Program<'a>) -> Self {
+    pub fn new(
+        source: &'a SourceFile,
+        allocator: &'a Allocator,
+        program: Program<'a>,
+        params: &'a TransformationParams,
+    ) -> Self {
         Self {
             source,
             allocator,
             program,
+            params,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransformationParams {
+    pub module_mapping: ModuleMapping,
+    pub module_meta: ModuleMetaMap,
 }
 
 pub fn parse_source(source: &SourceFile) -> Result<ParseSummary> {
