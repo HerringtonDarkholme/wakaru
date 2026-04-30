@@ -199,9 +199,9 @@ This list records the audited migration order for the default `packages/unminify
 | 3 | `un-boolean` | done | AST mutate pass converting `!0` and `!1`; already wired. |
 | 4 | `un-infinity` | done | AST mutate pass converting `1 / 0` and `-1 / 0`; already wired. |
 | 5 | `un-typeof` | done | AST mutate pass expanding `typeof x < "u"` and mirrored comparisons; already wired. |
-| 6 | `un-bracket-notation` | `AST mutate` | Simplify string computed members to dot or numeric members. |
-| 7 | `un-while-loop` | `AST mutate` | Convert `for (; test; )` and `for (;;)` to `while`. |
-| 8 | `un-assignment-merging` | `AST mutate` | Split chained assignments into multiple statements. |
+| 6 | `un-bracket-notation` | done | AST mutate pass simplifying string computed members to dot or numeric members; already wired. |
+| 7 | `un-while-loop` | done | AST mutate pass converting `for (; test; )` and `for (;;)` to `while`; already wired. |
+| 8 | `un-assignment-merging` | done | AST mutate pass splitting chained assignments into multiple statements when the final value is simple; already wired. |
 | 9 | `un-variable-merging` | `Semantic transform` | Split multi-declarator statements; needed before stronger module rewrites. |
 | 10 | `module-mapping` | `AST mutate` | Replace mapped numeric/string `require` ids; requires pipeline params. |
 | 11 | `un-curly-braces` | `AST mutate` | Add blocks around control-flow bodies; broad syntax surface. |
