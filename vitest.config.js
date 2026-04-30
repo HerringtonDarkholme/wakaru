@@ -15,8 +15,6 @@ export default defineConfig({
                 'testcases/**',
                 'packages/browserfs/**',
                 'packages/cli/**',
-                'packages/ide/**',
-                'packages/playground/**',
 
                 /**
                  * Specific files to exclude
