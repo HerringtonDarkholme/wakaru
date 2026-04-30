@@ -50,7 +50,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("module-mapping", pending_ast_transform),
     TransformationDescriptor::ast("un-curly-braces", pending_ast_transform),
     TransformationDescriptor::ast("un-sequence-expression", pending_ast_transform),
-    TransformationDescriptor::ast("un-variable-merging", pending_ast_transform),
+    TransformationDescriptor::ast("un-variable-merging", un_variable_merging::transform_ast),
     TransformationDescriptor::ast(
         "un-assignment-merging",
         un_assignment_merging::transform_ast,

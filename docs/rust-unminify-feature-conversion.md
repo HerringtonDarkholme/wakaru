@@ -202,7 +202,7 @@ This list records the audited migration order for the default `packages/unminify
 | 6 | `un-bracket-notation` | done | AST mutate pass simplifying string computed members to dot or numeric members; already wired. |
 | 7 | `un-while-loop` | done | AST mutate pass converting `for (; test; )` and `for (;;)` to `while`; already wired. |
 | 8 | `un-assignment-merging` | done | AST mutate pass splitting chained assignments into multiple statements when the final value is simple; already wired. |
-| 9 | `un-variable-merging` | `Semantic transform` | Split multi-declarator statements; needed before stronger module rewrites. |
+| 9 | `un-variable-merging` | done | AST mutate pass splitting multi-declarator variable declarations and extracting unused `var` declarators from `for` initializers; wired. Parent-scope detection currently mirrors covered TS behavior through direct parent statement declarations and should move to Oxc semantic data before broadening. |
 | 10 | `module-mapping` | `AST mutate` | Replace mapped numeric/string `require` ids; requires pipeline params. |
 | 11 | `un-curly-braces` | `AST mutate` | Add blocks around control-flow bodies; broad syntax surface. |
 | 12 | `un-return` | `AST mutate` | Remove redundant final returns and convert `return void expr`. |
