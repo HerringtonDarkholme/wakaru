@@ -218,7 +218,7 @@ This list records the audited migration order for the default `packages/unminify
 | 20 | `un-export-rename` | done | Semantic transform merging top-level declaration aliases into named exports; uses Oxc symbol/reference IDs so recursive references are renamed while shadowed bindings are preserved; wired. |
 | 21 | `un-import-rename` | done | Semantic transform renaming import aliases back to imported names, with sequential conflict suffixes and symbol/reference-safe use-site updates; wired. |
 | 22 | `un-undefined` | done | Semantic transform converting numeric `void` expressions to `undefined` only when Oxc scope lookup confirms `undefined` is not declared in the current scope chain; wired. |
-| 23 | Babel helper core | partial | `array-like`, `array-without-holes`, `to-consumable-array`, `sliced-to-array`, and `extends` helpers ported and wired through the Rust runtime helper composite. Remaining helper passes: object-spread, create-for-of. |
+| 23 | Babel helper core | partial | `array-like`, `array-without-holes`, `to-consumable-array`, `sliced-to-array`, `extends`, and `object-spread` helpers ported and wired through the Rust runtime helper composite. Remaining helper pass: create-for-of. |
 | 24 | `un-runtime-helper` | partial | Runs the currently ported Babel helper core subset. Helper annotation from module metadata is still pending. |
 | 25 | Babel interop helpers | `Semantic transform` | Port `interopRequireDefault` and `interopRequireWildcard`; required by `un-esm`. |
 | 26 | `un-esm` | `Semantic transform` | Convert CJS import/export shapes, dedupe imports, handle hoist option and missing require comments. |

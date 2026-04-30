@@ -17,5 +17,6 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     array_without_holes::transform_ast(source)?;
     to_consumable_array::transform_ast(source)?;
     sliced_to_array::transform_ast(source)?;
-    extends::transform_ast(source)
+    extends::transform_ast(source)?;
+    object_spread::transform_ast(source)
 }
