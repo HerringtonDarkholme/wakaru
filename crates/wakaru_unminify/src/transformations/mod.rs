@@ -60,7 +60,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     ),
     TransformationDescriptor::ast("un-runtime-helper", un_runtime_helper::transform_ast),
     TransformationDescriptor::ast("un-esm", un_esm::transform_ast),
-    TransformationDescriptor::ast("un-enum", pending_ast_transform),
+    TransformationDescriptor::ast("un-enum", un_enum::transform_ast),
     TransformationDescriptor::ast("lebab", pending_ast_transform),
     TransformationDescriptor::ast("un-export-rename", un_export_rename::transform_ast),
     TransformationDescriptor::ast("un-use-strict", un_use_strict::transform_ast),
