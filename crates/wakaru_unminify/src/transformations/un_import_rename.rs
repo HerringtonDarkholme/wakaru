@@ -20,7 +20,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
 
     let mut collector = ImportRenameCollector {
         ast: AstBuilder::new(source.allocator),
-        occupied_names: collect_root_names(&scoping),
+        occupied_names: collect_all_names(&scoping),
         renames: HashMap::new(),
     };
 
@@ -128,9 +128,10 @@ impl<'a> VisitMut<'a> for ImportReferenceRenamer<'a, '_> {
     }
 }
 
-fn collect_root_names(scoping: &Scoping) -> HashSet<String> {
+fn collect_all_names(scoping: &Scoping) -> HashSet<String> {
     scoping
-        .iter_bindings_in(scoping.root_scope_id())
+        .iter_bindings()
+        .flat_map(|(_, bindings)| bindings.values().copied())
         .map(|symbol_id| scoping.symbol_name(symbol_id).to_string())
         .collect()
 }
@@ -217,6 +218,27 @@ function test(a) {
   return a;
 }
 console.log(foo);
+",
+        );
+    }
+
+    #[test]
+    fn preserves_alias_when_imported_name_conflicts_with_nested_binding() {
+        define_ast_inline_test(transform_ast)(
+            "
+import { useRef as useRef_1 } from 'react';
+
+function test() {
+  const useRef = 1;
+  useRef_1();
+}
+",
+            "
+import { useRef as useRef_1 } from \"react\";
+function test() {
+  const useRef = 1;
+  useRef_1();
+}
 ",
         );
     }
