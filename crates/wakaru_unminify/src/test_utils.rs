@@ -21,10 +21,20 @@ pub(crate) fn define_inline_test(
 
 pub(crate) fn define_ast_inline_test(transform: AstTransformationFn) -> impl Fn(&str, &str) {
     move |input, expected| {
+        define_ast_inline_test_with_params(transform, TransformationParams::default())(
+            input, expected,
+        );
+    }
+}
+
+pub(crate) fn define_ast_inline_test_with_params(
+    transform: AstTransformationFn,
+    params: TransformationParams,
+) -> impl Fn(&str, &str) {
+    move |input, expected| {
         let source = SourceFile::from_parts(PathBuf::from("test.js"), input);
         let allocator = Allocator::default();
         let ret = parse_program(&allocator, &source).expect("input should parse");
-        let params = TransformationParams::default();
         let mut parsed_source = ParsedSourceFile::new(&source, &allocator, ret.program, &params);
 
         transform(&mut parsed_source).expect("transform should succeed");

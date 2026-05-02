@@ -78,6 +78,7 @@ impl<'a> ParsedSourceFile<'a> {
 pub struct TransformationParams {
     pub module_mapping: ModuleMapping,
     pub module_meta: ModuleMetaMap,
+    pub un_esm_hoist: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

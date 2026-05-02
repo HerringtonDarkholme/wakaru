@@ -103,6 +103,7 @@ pub fn run(cli: Cli) -> Result<()> {
         let params = PipelineParams {
             module_mapping: module_mapping(&modules),
             module_meta: module_meta_map(&modules),
+            ..PipelineParams::default()
         };
         let start = Instant::now();
 

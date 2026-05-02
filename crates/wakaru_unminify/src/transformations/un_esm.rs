@@ -27,7 +27,8 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     let namespace_hints =
         NamespaceImportHints::new(&source.source.code, &source.synthetic_trailing_comments);
     let ast = AstBuilder::new(source.allocator);
-    let mut transformer = CommonJsImportTransformer::new(ast, namespace_hints);
+    let mut transformer =
+        CommonJsImportTransformer::new(ast, namespace_hints, source.params.un_esm_hoist);
     transformer.transform_program(&mut source.program);
 
     let mut dynamic_import_transformer = DynamicRequireTransformer {
@@ -390,16 +391,18 @@ struct CommonJsImportTransformer<'a> {
     declared_names: HashSet<String>,
     namespace_hints: NamespaceImportHints,
     namespace_aliases: HashMap<String, NamespaceAlias>,
+    hoist: bool,
 }
 
 impl<'a> CommonJsImportTransformer<'a> {
-    fn new(ast: AstBuilder<'a>, namespace_hints: NamespaceImportHints) -> Self {
+    fn new(ast: AstBuilder<'a>, namespace_hints: NamespaceImportHints, hoist: bool) -> Self {
         Self {
             ast,
             imports: ImportManager::default(),
             declared_names: HashSet::new(),
             namespace_hints,
             namespace_aliases: HashMap::new(),
+            hoist,
         }
     }
 
@@ -431,6 +434,18 @@ impl<'a> CommonJsImportTransformer<'a> {
                     }
                 }
                 statement => kept_body.push(statement),
+            }
+        }
+
+        if self.hoist {
+            let mut hoister = HoistedRequireTransformer {
+                ast: self.ast,
+                imports: &mut self.imports,
+                declared_names: &mut self.declared_names,
+                fuzzy_imports: HashMap::new(),
+            };
+            for statement in &mut kept_body {
+                hoister.visit_statement(statement);
             }
         }
 
@@ -826,6 +841,197 @@ struct NamespaceAlias {
     alias: String,
 }
 
+struct HoistedRequireTransformer<'a, 'b> {
+    ast: AstBuilder<'a>,
+    imports: &'b mut ImportManager,
+    declared_names: &'b mut HashSet<String>,
+    fuzzy_imports: HashMap<String, String>,
+}
+
+impl<'a> VisitMut<'a> for HoistedRequireTransformer<'a, '_> {
+    fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        let old_statements = statements.take_in(self.ast);
+        let mut new_statements = self.ast.vec_with_capacity(old_statements.len());
+
+        for statement in old_statements {
+            match self.transform_hoisted_statement(statement) {
+                Ok(replacements) => new_statements.extend(replacements),
+                Err(statement) => {
+                    let mut statement = statement;
+                    walk_mut::walk_statement(self, &mut statement);
+                    new_statements.push(statement);
+                }
+            }
+        }
+
+        *statements = new_statements;
+    }
+
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+
+        let Some(source) = require_call_source(expression).map(str::to_string) else {
+            return;
+        };
+
+        let local = self.fuzzy_import_local(&source);
+        *expression = self
+            .ast
+            .expression_identifier(Span::default(), self.ast.ident(&local));
+    }
+}
+
+impl<'a> HoistedRequireTransformer<'a, '_> {
+    fn fuzzy_import_local(&mut self, source: &str) -> String {
+        if let Some(local) = self.fuzzy_imports.get(source) {
+            return local.clone();
+        }
+
+        let local = import_local_from_source(source, self.declared_names);
+        self.imports.add_default(source, &local);
+        self.fuzzy_imports.insert(source.to_string(), local.clone());
+        local
+    }
+
+    fn transform_hoisted_statement(
+        &mut self,
+        statement: Statement<'a>,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, Statement<'a>> {
+        match statement {
+            Statement::ExpressionStatement(statement) => {
+                let Some(source) = require_call_source(&statement.expression).map(str::to_string)
+                else {
+                    return Err(Statement::ExpressionStatement(statement));
+                };
+                self.imports.add_bare(&source);
+                Ok(self.ast.vec())
+            }
+            Statement::VariableDeclaration(declaration) => {
+                self.transform_hoisted_variable_declaration(declaration)
+            }
+            statement => Err(statement),
+        }
+    }
+
+    fn transform_hoisted_variable_declaration(
+        &mut self,
+        mut declaration: oxc_allocator::Box<'a, VariableDeclaration<'a>>,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, Statement<'a>> {
+        if declaration.declarations.len() != 1 {
+            return Err(Statement::VariableDeclaration(declaration));
+        }
+
+        let span = declaration.span;
+        let kind = declaration.kind;
+        let declare = declaration.declare;
+        let mut declarations = declaration.declarations.take_in(self.ast);
+        let declarator = declarations
+            .pop()
+            .expect("single-declaration vector should have one item");
+
+        if self.collect_basic_require(&declarator) {
+            return Ok(self.ast.vec());
+        }
+
+        match self.collect_member_require(declarator, span, kind, declare) {
+            Ok(replacements) => Ok(replacements),
+            Err(declarator) => {
+                declaration.declarations = self.ast.vec_from_array([declarator]);
+                Err(Statement::VariableDeclaration(declaration))
+            }
+        }
+    }
+
+    fn collect_basic_require(&mut self, declarator: &VariableDeclarator<'a>) -> bool {
+        let Some(source) = declarator.init.as_ref().and_then(require_call_source) else {
+            return false;
+        };
+
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) => {
+                self.imports.add_default(source, identifier.name.as_str());
+                true
+            }
+            BindingPattern::ObjectPattern(_) => {
+                let Some(imports) = named_imports_from_object_pattern(&declarator.id) else {
+                    return false;
+                };
+                for (imported, local) in imports {
+                    self.imports.add_named(source, &imported, &local);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_member_require(
+        &mut self,
+        declarator: VariableDeclarator<'a>,
+        declaration_span: Span,
+        declaration_kind: VariableDeclarationKind,
+        declaration_declare: bool,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, VariableDeclarator<'a>> {
+        let Some((source, imported)) = member_require_source_and_imported(&declarator) else {
+            return Err(declarator);
+        };
+        if imported != "default" && !is_valid_identifier_name(&imported) {
+            return Err(declarator);
+        }
+
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) if imported == "default" => {
+                self.imports.add_default(&source, identifier.name.as_str());
+                Ok(self.ast.vec())
+            }
+            BindingPattern::BindingIdentifier(identifier) => {
+                self.imports
+                    .add_named(&source, &imported, identifier.name.as_str());
+                Ok(self.ast.vec())
+            }
+            BindingPattern::ObjectPattern(_) if imported == "default" => {
+                let Some(imports) = named_imports_from_object_pattern(&declarator.id) else {
+                    return Err(declarator);
+                };
+                for (imported, local) in imports {
+                    self.imports.add_named(&source, &imported, &local);
+                }
+                Ok(self.ast.vec())
+            }
+            BindingPattern::ObjectPattern(_) => {
+                let local = if self.declared_names.contains(&imported) {
+                    generate_name(&imported, self.declared_names)
+                } else {
+                    imported.clone()
+                };
+                self.declared_names.insert(local.clone());
+                self.imports.add_named(&source, &imported, &local);
+
+                let init = self
+                    .ast
+                    .expression_identifier(Span::default(), self.ast.ident(&local));
+                let replacement_declarator = self.ast.variable_declarator(
+                    declarator.span,
+                    declaration_kind,
+                    declarator.id,
+                    None::<oxc_allocator::Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
+                    Some(init),
+                    false,
+                );
+                let replacement =
+                    Statement::VariableDeclaration(self.ast.alloc_variable_declaration(
+                        declaration_span,
+                        declaration_kind,
+                        self.ast.vec_from_array([replacement_declarator]),
+                        declaration_declare,
+                    ));
+                Ok(self.ast.vec_from_array([replacement]))
+            }
+            _ => Err(declarator),
+        }
+    }
+}
+
 struct NamespaceAliasRenamer<'a, 'm> {
     ast: AstBuilder<'a>,
     rename_map: &'m HashMap<String, String>,
@@ -1213,6 +1419,24 @@ fn basic_require_binding(declaration: &VariableDeclaration) -> Option<(String, S
     Some((local, source))
 }
 
+fn member_require_source_and_imported(declarator: &VariableDeclarator) -> Option<(String, String)> {
+    match declarator.init.as_ref()? {
+        Expression::StaticMemberExpression(member) => {
+            let source = require_call_source(&member.object)?.to_string();
+            let imported = member.property.name.as_str().to_string();
+            Some((source, imported))
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let source = require_call_source(&member.object)?.to_string();
+            let Expression::StringLiteral(property) = &member.expression else {
+                return None;
+            };
+            Some((source, property.value.as_str().to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn variable_alias_binding(declaration: &VariableDeclaration) -> Option<(String, String)> {
     if declaration.declarations.len() != 1 {
         return None;
@@ -1464,6 +1688,26 @@ fn generate_name(base: &str, declared_names: &HashSet<String>) -> String {
     }
 }
 
+fn import_local_from_source(source: &str, declared_names: &mut HashSet<String>) -> String {
+    let base = source
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("module");
+    let base = if is_valid_identifier_name(base) {
+        base.to_string()
+    } else {
+        "module".to_string()
+    };
+    let local = if declared_names.contains(&base) {
+        generate_name(&base, declared_names)
+    } else {
+        base
+    };
+    declared_names.insert(local.clone());
+    local
+}
+
 fn expression_into_export_default_kind(expression: Expression) -> ExportDefaultDeclarationKind {
     match expression {
         Expression::BooleanLiteral(value) => ExportDefaultDeclarationKind::BooleanLiteral(value),
@@ -1573,7 +1817,8 @@ fn number_string(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::define_ast_inline_test;
+    use crate::test_utils::{define_ast_inline_test, define_ast_inline_test_with_params};
+    use wakaru_core::source::TransformationParams;
 
     #[test]
     fn converts_top_level_requires_to_imports() {
@@ -1658,6 +1903,85 @@ function fn() {
   var baz = require(\"baz\").baz;
   return bar + baz;
 }
+",
+        );
+    }
+
+    #[test]
+    fn hoists_non_top_level_requires_when_enabled() {
+        define_ast_inline_test_with_params(
+            transform_ast,
+            TransformationParams {
+                un_esm_hoist: true,
+                ..TransformationParams::default()
+            },
+        )(
+            "
+function fn() {
+  require('foo');
+  var bar = require('bar');
+  var baz = require('baz').baz;
+  return bar + baz;
+}
+",
+            "
+import \"foo\";
+import bar from \"bar\";
+import { baz } from \"baz\";
+function fn() {
+  return bar + baz;
+}
+",
+        );
+    }
+
+    #[test]
+    fn hoists_property_destructuring_with_scope_conflicts() {
+        define_ast_inline_test_with_params(
+            transform_ast,
+            TransformationParams {
+                un_esm_hoist: true,
+                ..TransformationParams::default()
+            },
+        )(
+            "
+var bar = 1;
+function fn() {
+  var { baz } = require('foo').bar;
+  return baz;
+}
+",
+            "
+import { bar as bar_1 } from \"foo\";
+var bar = 1;
+function fn() {
+  var { baz } = bar_1;
+  return baz;
+}
+",
+        );
+    }
+
+    #[test]
+    fn hoists_fuzzy_requires_when_enabled() {
+        define_ast_inline_test_with_params(
+            transform_ast,
+            TransformationParams {
+                un_esm_hoist: true,
+                ..TransformationParams::default()
+            },
+        )(
+            "
+var foo = require(\"bar\")(\"baz\");
+var buz = require(\"bar\").bar(\"baz\");
+var value = require(\"foo\")(\"baz\");
+",
+            "
+import bar from \"bar\";
+import foo_1 from \"foo\";
+var foo = bar(\"baz\");
+var buz = bar.bar(\"baz\");
+var value = foo_1(\"baz\");
 ",
         );
     }

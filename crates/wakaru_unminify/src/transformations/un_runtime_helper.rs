@@ -108,6 +108,7 @@ function untouched() {
                         ],
                     )],
                 )]),
+                ..TransformationParams::default()
             },
         );
 
@@ -145,6 +146,7 @@ function helper() {
                     "1",
                     [("helper", vec!["@babel/runtime/helpers/extends"])],
                 )]),
+                ..TransformationParams::default()
             },
         );
 
