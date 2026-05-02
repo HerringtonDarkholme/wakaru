@@ -56,15 +56,17 @@ impl<'a> OptionalChainingTransformer<'a> {
             return None;
         };
 
-        let (temp_name, target) = optional_member_guard(conditional)?;
+        let guard = optional_member_guard(conditional)?;
         let replacement = self.optional_chain_expression(
             conditional.span,
-            target,
-            temp_name,
+            guard.target,
+            guard.temp_name,
             without_parentheses(&conditional.alternate),
         )?;
 
-        self.unused_temps.insert(temp_name.to_string());
+        if let Some(temp_name) = guard.unused_temp {
+            self.unused_temps.insert(temp_name.to_string());
+        }
         Some(replacement)
     }
 
@@ -185,6 +187,11 @@ impl<'a> OptionalChainingTransformer<'a> {
             {
                 self.optional_apply_member_call(span, target, temp_name, apply_member, call)
             }
+            Expression::StaticMemberExpression(bind_member)
+                if bind_member.property.name == "bind" =>
+            {
+                self.optional_bind_member_expression(span, target, temp_name, bind_member, call)
+            }
             _ => None,
         }
     }
@@ -302,6 +309,50 @@ impl<'a> OptionalChainingTransformer<'a> {
         arguments
     }
 
+    fn optional_bind_member_expression(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        bind_member: &oxc_ast::ast::StaticMemberExpression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let first_argument = call.arguments.first()?;
+        let expected_this = call_this_expression(target);
+        if !argument_matches_expression(first_argument, expected_this)
+            && !argument_matches_identifier(first_argument, temp_name)
+        {
+            return None;
+        }
+
+        let optional_member = match without_parentheses(&bind_member.object) {
+            Expression::StaticMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
+                    member.span,
+                    target.clone_in(self.ast.allocator),
+                    member.property.clone_in(self.ast.allocator),
+                    true,
+                ))
+            }
+            Expression::ComputedMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                Expression::ComputedMemberExpression(self.ast.alloc_computed_member_expression(
+                    member.span,
+                    target.clone_in(self.ast.allocator),
+                    member.expression.clone_in(self.ast.allocator),
+                    true,
+                ))
+            }
+            _ => return None,
+        };
+
+        let chain_element = optional_member.into_chain_element()?;
+        Some(self.ast.expression_chain(span, chain_element))
+    }
+
     fn optional_call(
         &self,
         span: Span,
@@ -382,7 +433,7 @@ impl<'a> OptionalChainingTransformer<'a> {
 
 fn optional_member_guard<'a, 'b>(
     conditional: &'b ConditionalExpression<'a>,
-) -> Option<(&'b str, &'b Expression<'a>)> {
+) -> Option<OptionalOrGuard<'a, 'b>> {
     if !is_undefined_expression(without_parentheses(&conditional.consequent)) {
         return None;
     }
@@ -394,13 +445,27 @@ fn optional_member_guard<'a, 'b>(
         return None;
     }
 
-    let (temp_name, target) = assignment_null_check(without_parentheses(&logical.left))?;
-
-    if !identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
-        return None;
+    if let Some((temp_name, target)) = assignment_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: Some(temp_name),
+            });
+        }
     }
 
-    Some((temp_name, target))
+    if let Some((temp_name, target)) = identifier_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: None,
+            });
+        }
+    }
+
+    None
 }
 
 struct OptionalOrGuard<'a, 'b> {
@@ -784,6 +849,23 @@ var _foo, _bar, _baz;
 foo?.(...args);
 foo.bar?.(baz, qux);
 foo?.bar?.(...args);
+",
+        );
+    }
+
+    #[test]
+    fn restores_bind_optional_member_expressions() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo, _bar;
+((_foo = foo) === null || _foo === void 0 ? void 0 : _foo.m.bind(_foo))();
+((_bar = foo) === null || _bar === void 0 ? void 0 : _bar[method].bind(_bar))();
+(Foo === null || Foo === void 0 ? void 0 : Foo[\"m\"].bind(Foo))();
+",
+            "
+(foo?.m)();
+(foo?.[method])();
+(Foo?.[\"m\"])();
 ",
         );
     }
