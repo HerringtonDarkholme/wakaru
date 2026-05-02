@@ -1,16 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::TakeIn;
 use oxc_ast::{
     ast::{
-        Argument, BindingPattern, CallExpression, Expression, ImportDeclaration,
+        Argument, AssignmentTarget, BindingPattern, CallExpression, Declaration,
+        ExportDefaultDeclarationKind, ExportSpecifier, Expression, ImportDeclaration,
         ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, Program, PropertyKey,
-        Statement, VariableDeclaration, VariableDeclarator,
+        Statement, VariableDeclaration, VariableDeclarationKind, VariableDeclarator, WithClause,
     },
     AstBuilder,
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_span::Span;
+use oxc_syntax::operator::AssignmentOperator;
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::{ParsedSourceFile, SyntheticTrailingComment};
 
@@ -31,12 +33,353 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     };
     dynamic_import_transformer.visit_program(&mut source.program);
 
+    let mut export_transformer = CommonJsExportTransformer {
+        ast: AstBuilder::new(source.allocator),
+    };
+    export_transformer.transform_program(&mut source.program);
+
     let mut annotator = MissingRequireAnnotator {
         synthetic_trailing_comments: &mut source.synthetic_trailing_comments,
     };
     annotator.visit_program(&mut source.program);
 
     Ok(())
+}
+
+struct CommonJsExportTransformer<'a> {
+    ast: AstBuilder<'a>,
+}
+
+impl<'a> CommonJsExportTransformer<'a> {
+    fn transform_program(&mut self, program: &mut Program<'a>) {
+        let old_body = program.body.take_in(self.ast);
+        let last_exports = collect_last_export_indices(&old_body);
+        let mut declared_names = collect_top_level_declared_names(&old_body);
+        let mut new_body = self.ast.vec_with_capacity(old_body.len());
+
+        for (index, statement) in old_body.into_iter().enumerate() {
+            let replacements =
+                self.transform_statement(index, statement, &last_exports, &mut declared_names);
+            new_body.extend(replacements);
+        }
+
+        program.body = new_body;
+    }
+
+    fn transform_statement(
+        &mut self,
+        index: usize,
+        statement: Statement<'a>,
+        last_exports: &HashMap<String, usize>,
+        declared_names: &mut HashSet<String>,
+    ) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        let statement = match self.transform_expression_export(
+            index,
+            statement,
+            last_exports,
+            declared_names,
+        ) {
+            Ok(replacements) => return replacements,
+            Err(statement) => statement,
+        };
+
+        let statement =
+            match self.transform_variable_export(index, statement, last_exports, declared_names) {
+                Ok(replacements) => return replacements,
+                Err(statement) => statement,
+            };
+
+        let mut statements = self.ast.vec_with_capacity(1);
+        statements.push(statement);
+        statements
+    }
+
+    fn transform_expression_export(
+        &mut self,
+        index: usize,
+        statement: Statement<'a>,
+        last_exports: &HashMap<String, usize>,
+        declared_names: &mut HashSet<String>,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, Statement<'a>> {
+        let Statement::ExpressionStatement(mut statement) = statement else {
+            return Err(statement);
+        };
+        let expression = statement.expression.take_in(self.ast);
+        let mut assignment = match expression {
+            Expression::AssignmentExpression(assignment) => assignment,
+            expression => return Err(self.ast.statement_expression(statement.span, expression)),
+        };
+        if assignment.operator != AssignmentOperator::Assign {
+            return Err(self.ast.statement_expression(
+                statement.span,
+                Expression::AssignmentExpression(assignment),
+            ));
+        }
+
+        let Some(export_name) = export_assignment_name(&assignment.left) else {
+            return Err(self.ast.statement_expression(
+                statement.span,
+                Expression::AssignmentExpression(assignment),
+            ));
+        };
+        if last_exports.get(&export_name).copied() != Some(index) {
+            return Ok(self.ast.vec());
+        }
+
+        let mut statements = self.ast.vec();
+        let right = assignment.right.take_in(self.ast);
+        if export_name == "default" {
+            statements.push(self.export_default_statement(statement.span, right));
+        } else {
+            self.push_named_export_assignment(
+                statement.span,
+                &export_name,
+                right,
+                VariableDeclarationKind::Const,
+                declared_names,
+                &mut statements,
+            );
+        }
+        Ok(statements)
+    }
+
+    fn transform_variable_export(
+        &mut self,
+        index: usize,
+        statement: Statement<'a>,
+        last_exports: &HashMap<String, usize>,
+        _declared_names: &mut HashSet<String>,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, Statement<'a>> {
+        let Statement::VariableDeclaration(mut declaration) = statement else {
+            return Err(statement);
+        };
+        if declaration.declarations.len() != 1 {
+            return Err(Statement::VariableDeclaration(declaration));
+        }
+
+        let span = declaration.span;
+        let kind = declaration.kind;
+        let declare = declaration.declare;
+        let mut declarations = declaration.declarations.take_in(self.ast);
+        let mut declarator = declarations
+            .pop()
+            .expect("single-declaration vector should have one item");
+        let Some(id_name) = binding_identifier_name(&declarator.id).map(str::to_string) else {
+            declaration.declarations = self.ast.vec_from_array([declarator]);
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        let mut assignment = match declarator.init.take() {
+            Some(Expression::AssignmentExpression(assignment)) => assignment,
+            init => {
+                declarator.init = init;
+                declaration.declarations = self.ast.vec_from_array([declarator]);
+                return Err(Statement::VariableDeclaration(declaration));
+            }
+        };
+        if assignment.operator != AssignmentOperator::Assign {
+            declarator.init = Some(Expression::AssignmentExpression(assignment));
+            declaration.declarations = self.ast.vec_from_array([declarator]);
+            return Err(Statement::VariableDeclaration(declaration));
+        }
+
+        let Some(export_name) = export_assignment_name(&assignment.left) else {
+            declarator.init = Some(Expression::AssignmentExpression(assignment));
+            declaration.declarations = self.ast.vec_from_array([declarator]);
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        if last_exports.get(&export_name).copied() != Some(index) {
+            return Ok(self.ast.vec());
+        }
+
+        let mut statements = self.ast.vec();
+        let right = assignment.right.take_in(self.ast);
+        if export_name == "default" {
+            declarator.init = Some(right);
+            statements.push(self.variable_declaration_statement(span, kind, declare, declarator));
+            statements
+                .push(self.export_default_statement(span, self.identifier_expression(&id_name)));
+        } else if id_name == export_name {
+            declarator.init = Some(right);
+            statements.push(self.export_variable_statement(span, kind, declare, declarator));
+        } else {
+            statements.push(self.variable_declaration_statement(
+                span,
+                kind,
+                declare,
+                self.variable_declarator(
+                    span,
+                    kind,
+                    declarator.id,
+                    self.identifier_expression(&export_name),
+                ),
+            ));
+            statements.push(self.export_variable_statement(
+                span,
+                kind,
+                declare,
+                self.variable_declarator(
+                    span,
+                    kind,
+                    self.binding_identifier_pattern(&export_name),
+                    right,
+                ),
+            ));
+        }
+        Ok(statements)
+    }
+
+    fn push_named_export_assignment(
+        &mut self,
+        span: Span,
+        export_name: &str,
+        right: Expression<'a>,
+        kind: VariableDeclarationKind,
+        declared_names: &mut HashSet<String>,
+        statements: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+    ) {
+        if let Some(local) = expression_identifier_name(&right) {
+            if local == export_name {
+                statements.push(self.export_specifier_statement(span, local, export_name));
+                return;
+            }
+
+            if declared_names.contains(export_name) {
+                statements.push(self.export_specifier_statement(span, local, export_name));
+                return;
+            }
+        }
+
+        if declared_names.contains(export_name) {
+            let local = generate_name(export_name, declared_names);
+            declared_names.insert(local.clone());
+            statements.push(self.variable_declaration_statement(
+                span,
+                kind,
+                false,
+                self.variable_declarator(
+                    span,
+                    kind,
+                    self.binding_identifier_pattern(&local),
+                    right,
+                ),
+            ));
+            statements.push(self.export_specifier_statement(span, &local, export_name));
+            return;
+        }
+
+        declared_names.insert(export_name.to_string());
+        statements.push(self.export_variable_statement(
+            span,
+            kind,
+            false,
+            self.variable_declarator(
+                span,
+                kind,
+                self.binding_identifier_pattern(export_name),
+                right,
+            ),
+        ));
+    }
+
+    fn export_default_statement(&self, span: Span, expression: Expression<'a>) -> Statement<'a> {
+        Statement::ExportDefaultDeclaration(self.ast.alloc_export_default_declaration(
+            span,
+            expression_into_export_default_kind(expression),
+        ))
+    }
+
+    fn export_variable_statement(
+        &self,
+        span: Span,
+        kind: VariableDeclarationKind,
+        declare: bool,
+        declarator: VariableDeclarator<'a>,
+    ) -> Statement<'a> {
+        let declaration = Declaration::VariableDeclaration(self.ast.alloc_variable_declaration(
+            span,
+            kind,
+            self.ast.vec_from_array([declarator]),
+            declare,
+        ));
+        Statement::ExportNamedDeclaration(self.ast.alloc_export_named_declaration(
+            span,
+            Some(declaration),
+            self.ast.vec(),
+            None,
+            ImportOrExportKind::Value,
+            None::<oxc_allocator::Box<'a, WithClause<'a>>>,
+        ))
+    }
+
+    fn export_specifier_statement(&self, span: Span, local: &str, exported: &str) -> Statement<'a> {
+        Statement::ExportNamedDeclaration(
+            self.ast.alloc_export_named_declaration(
+                span,
+                None,
+                self.ast
+                    .vec_from_array([self.export_specifier(span, local, exported)]),
+                None,
+                ImportOrExportKind::Value,
+                None::<oxc_allocator::Box<'a, WithClause<'a>>>,
+            ),
+        )
+    }
+
+    fn export_specifier(&self, span: Span, local: &str, exported: &str) -> ExportSpecifier<'a> {
+        self.ast.export_specifier(
+            span,
+            self.module_export_name(local),
+            self.module_export_name(exported),
+            ImportOrExportKind::Value,
+        )
+    }
+
+    fn variable_declaration_statement(
+        &self,
+        span: Span,
+        kind: VariableDeclarationKind,
+        declare: bool,
+        declarator: VariableDeclarator<'a>,
+    ) -> Statement<'a> {
+        Statement::VariableDeclaration(self.ast.alloc_variable_declaration(
+            span,
+            kind,
+            self.ast.vec_from_array([declarator]),
+            declare,
+        ))
+    }
+
+    fn variable_declarator(
+        &self,
+        span: Span,
+        kind: VariableDeclarationKind,
+        id: BindingPattern<'a>,
+        init: Expression<'a>,
+    ) -> VariableDeclarator<'a> {
+        self.ast.variable_declarator(
+            span,
+            kind,
+            id,
+            None::<oxc_allocator::Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
+            Some(init),
+            false,
+        )
+    }
+
+    fn binding_identifier_pattern(&self, name: &str) -> BindingPattern<'a> {
+        self.ast
+            .binding_pattern_binding_identifier(Span::default(), self.ast.ident(name))
+    }
+
+    fn identifier_expression(&self, name: &str) -> Expression<'a> {
+        self.ast
+            .expression_identifier(Span::default(), self.ast.ident(name))
+    }
+
+    fn module_export_name(&self, name: &str) -> ModuleExportName<'a> {
+        self.ast
+            .module_export_name_identifier_name(Span::default(), self.ast.ident(name))
+    }
 }
 
 struct CommonJsImportTransformer<'a> {
@@ -535,6 +878,258 @@ fn imported_name<'a>(imported: &'a ModuleExportName<'a>) -> Option<&'a str> {
     }
 }
 
+fn collect_last_export_indices(body: &oxc_allocator::Vec<Statement>) -> HashMap<String, usize> {
+    let mut exports = HashMap::new();
+
+    for (index, statement) in body.iter().enumerate() {
+        let Some(name) = statement_export_name(statement) else {
+            continue;
+        };
+        exports.insert(name, index);
+    }
+
+    exports
+}
+
+fn statement_export_name(statement: &Statement) -> Option<String> {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            let Expression::AssignmentExpression(assignment) = &statement.expression else {
+                return None;
+            };
+            if assignment.operator != AssignmentOperator::Assign {
+                return None;
+            }
+            if export_assignment_name(&assignment.left).as_deref() == Some("default")
+                && is_module_exports_expression(&assignment.right)
+            {
+                return None;
+            }
+            export_assignment_name(&assignment.left)
+        }
+        Statement::VariableDeclaration(declaration) => {
+            if declaration.declarations.len() != 1 {
+                return None;
+            }
+
+            let declarator = &declaration.declarations[0];
+            let Some(Expression::AssignmentExpression(assignment)) = &declarator.init else {
+                return None;
+            };
+            if assignment.operator != AssignmentOperator::Assign {
+                return None;
+            }
+
+            export_assignment_name(&assignment.left)
+        }
+        _ => None,
+    }
+}
+
+fn export_assignment_name(target: &AssignmentTarget) -> Option<String> {
+    match target {
+        AssignmentTarget::StaticMemberExpression(member) => {
+            if is_module_exports_root(&member.object, member.property.name.as_str()) {
+                return Some("default".to_string());
+            }
+
+            if is_export_object_expression(&member.object) {
+                return Some(member.property.name.as_str().to_string());
+            }
+
+            None
+        }
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            if !is_export_object_expression(&member.object) {
+                return None;
+            }
+
+            let Expression::StringLiteral(property) = &member.expression else {
+                return None;
+            };
+
+            Some(property.value.as_str().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_export_object_expression(expression: &Expression) -> bool {
+    matches!(expression, Expression::Identifier(identifier) if identifier.name == "exports")
+        || is_module_exports_expression(expression)
+}
+
+fn is_module_exports_expression(expression: &Expression) -> bool {
+    let Expression::StaticMemberExpression(member) = expression else {
+        return false;
+    };
+    is_module_exports_root(&member.object, member.property.name.as_str())
+}
+
+fn is_module_exports_root(object: &Expression, property: &str) -> bool {
+    property == "exports"
+        && matches!(object, Expression::Identifier(identifier) if identifier.name == "module")
+}
+
+fn collect_top_level_declared_names(body: &oxc_allocator::Vec<Statement>) -> HashSet<String> {
+    let mut names = HashSet::new();
+
+    for statement in body {
+        match statement {
+            Statement::ImportDeclaration(import) => {
+                if let Some(specifiers) = &import.specifiers {
+                    for specifier in specifiers {
+                        match specifier {
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
+                                names.insert(default.local.name.as_str().to_string());
+                            }
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
+                                names.insert(namespace.local.name.as_str().to_string());
+                            }
+                            ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                                names.insert(named.local.name.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    if let Some(name) = binding_identifier_name(&declarator.id) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            Statement::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    names.insert(id.name.as_str().to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    names.insert(id.name.as_str().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    names
+}
+
+fn binding_identifier_name<'b, 'a>(pattern: &'b BindingPattern<'a>) -> Option<&'b str> {
+    let BindingPattern::BindingIdentifier(identifier) = pattern else {
+        return None;
+    };
+    Some(identifier.name.as_str())
+}
+
+fn expression_identifier_name<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b str> {
+    let Expression::Identifier(identifier) = expression else {
+        return None;
+    };
+    Some(identifier.name.as_str())
+}
+
+fn generate_name(base: &str, declared_names: &HashSet<String>) -> String {
+    let mut index = 1;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if !declared_names.contains(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn expression_into_export_default_kind(expression: Expression) -> ExportDefaultDeclarationKind {
+    match expression {
+        Expression::BooleanLiteral(value) => ExportDefaultDeclarationKind::BooleanLiteral(value),
+        Expression::NullLiteral(value) => ExportDefaultDeclarationKind::NullLiteral(value),
+        Expression::NumericLiteral(value) => ExportDefaultDeclarationKind::NumericLiteral(value),
+        Expression::BigIntLiteral(value) => ExportDefaultDeclarationKind::BigIntLiteral(value),
+        Expression::RegExpLiteral(value) => ExportDefaultDeclarationKind::RegExpLiteral(value),
+        Expression::StringLiteral(value) => ExportDefaultDeclarationKind::StringLiteral(value),
+        Expression::TemplateLiteral(value) => ExportDefaultDeclarationKind::TemplateLiteral(value),
+        Expression::Identifier(value) => ExportDefaultDeclarationKind::Identifier(value),
+        Expression::MetaProperty(value) => ExportDefaultDeclarationKind::MetaProperty(value),
+        Expression::Super(value) => ExportDefaultDeclarationKind::Super(value),
+        Expression::ArrayExpression(value) => ExportDefaultDeclarationKind::ArrayExpression(value),
+        Expression::ArrowFunctionExpression(value) => {
+            ExportDefaultDeclarationKind::ArrowFunctionExpression(value)
+        }
+        Expression::AssignmentExpression(value) => {
+            ExportDefaultDeclarationKind::AssignmentExpression(value)
+        }
+        Expression::AwaitExpression(value) => ExportDefaultDeclarationKind::AwaitExpression(value),
+        Expression::BinaryExpression(value) => {
+            ExportDefaultDeclarationKind::BinaryExpression(value)
+        }
+        Expression::CallExpression(value) => ExportDefaultDeclarationKind::CallExpression(value),
+        Expression::ChainExpression(value) => ExportDefaultDeclarationKind::ChainExpression(value),
+        Expression::ClassExpression(value) => ExportDefaultDeclarationKind::ClassExpression(value),
+        Expression::ComputedMemberExpression(value) => {
+            ExportDefaultDeclarationKind::ComputedMemberExpression(value)
+        }
+        Expression::ConditionalExpression(value) => {
+            ExportDefaultDeclarationKind::ConditionalExpression(value)
+        }
+        Expression::FunctionExpression(value) => {
+            ExportDefaultDeclarationKind::FunctionExpression(value)
+        }
+        Expression::ImportExpression(value) => {
+            ExportDefaultDeclarationKind::ImportExpression(value)
+        }
+        Expression::LogicalExpression(value) => {
+            ExportDefaultDeclarationKind::LogicalExpression(value)
+        }
+        Expression::NewExpression(value) => ExportDefaultDeclarationKind::NewExpression(value),
+        Expression::ObjectExpression(value) => {
+            ExportDefaultDeclarationKind::ObjectExpression(value)
+        }
+        Expression::ParenthesizedExpression(value) => {
+            ExportDefaultDeclarationKind::ParenthesizedExpression(value)
+        }
+        Expression::PrivateFieldExpression(value) => {
+            ExportDefaultDeclarationKind::PrivateFieldExpression(value)
+        }
+        Expression::StaticMemberExpression(value) => {
+            ExportDefaultDeclarationKind::StaticMemberExpression(value)
+        }
+        Expression::SequenceExpression(value) => {
+            ExportDefaultDeclarationKind::SequenceExpression(value)
+        }
+        Expression::TaggedTemplateExpression(value) => {
+            ExportDefaultDeclarationKind::TaggedTemplateExpression(value)
+        }
+        Expression::ThisExpression(value) => ExportDefaultDeclarationKind::ThisExpression(value),
+        Expression::UnaryExpression(value) => ExportDefaultDeclarationKind::UnaryExpression(value),
+        Expression::UpdateExpression(value) => {
+            ExportDefaultDeclarationKind::UpdateExpression(value)
+        }
+        Expression::YieldExpression(value) => ExportDefaultDeclarationKind::YieldExpression(value),
+        Expression::PrivateInExpression(value) => {
+            ExportDefaultDeclarationKind::PrivateInExpression(value)
+        }
+        Expression::JSXElement(value) => ExportDefaultDeclarationKind::JSXElement(value),
+        Expression::JSXFragment(value) => ExportDefaultDeclarationKind::JSXFragment(value),
+        Expression::TSAsExpression(value) => ExportDefaultDeclarationKind::TSAsExpression(value),
+        Expression::TSSatisfiesExpression(value) => {
+            ExportDefaultDeclarationKind::TSSatisfiesExpression(value)
+        }
+        Expression::TSTypeAssertion(value) => ExportDefaultDeclarationKind::TSTypeAssertion(value),
+        Expression::TSNonNullExpression(value) => {
+            ExportDefaultDeclarationKind::TSNonNullExpression(value)
+        }
+        Expression::TSInstantiationExpression(value) => {
+            ExportDefaultDeclarationKind::TSInstantiationExpression(value)
+        }
+        Expression::V8IntrinsicExpression(value) => {
+            ExportDefaultDeclarationKind::V8IntrinsicExpression(value)
+        }
+    }
+}
+
 fn is_valid_identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -652,6 +1247,83 @@ Promise.resolve().then(() => _interopRequireWildcard(require('bar')));
             "
 import(\"foo\");
 import(\"bar\");
+",
+        );
+    }
+
+    #[test]
+    fn converts_commonjs_default_and_named_exports() {
+        define_ast_inline_test(transform_ast)(
+            "
+module.exports = { foo: 1 };
+exports.bar = bar;
+module.exports.baz = 2;
+",
+            "
+export default { foo: 1 };
+export { bar };
+export const baz = 2;
+",
+        );
+    }
+
+    #[test]
+    fn keeps_last_duplicate_exports_and_skips_default_self_alias() {
+        define_ast_inline_test(transform_ast)(
+            "
+module.exports.foo = void 0;
+module.exports.foo = 2;
+function foo() {}
+module.exports = foo;
+module.exports.default = module.exports;
+",
+            "
+const foo_1 = 2;
+export { foo_1 as foo };
+function foo() {}
+export default foo;
+",
+        );
+    }
+
+    #[test]
+    fn converts_babel_assignment_variable_exports() {
+        define_ast_inline_test(transform_ast)(
+            "
+var foo = exports.foo = 1;
+var bar = exports.baz = 2;
+var qux = module.exports.default = 3;
+",
+            "
+export var foo = 1;
+var bar = baz;
+export var baz = 2;
+var qux = 3;
+export default qux;
+",
+        );
+    }
+
+    #[test]
+    fn resolves_named_export_binding_conflicts() {
+        define_ast_inline_test(transform_ast)(
+            "
+var foo = 1;
+console.log(foo);
+exports.foo = 2;
+
+const baz = 3;
+const qux = 4;
+module.exports.baz = qux;
+",
+            "
+var foo = 1;
+console.log(foo);
+const foo_1 = 2;
+export { foo_1 as foo };
+const baz = 3;
+const qux = 4;
+export { qux as baz };
 ",
         );
     }

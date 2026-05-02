@@ -183,7 +183,7 @@ mod tests {
         let result = run_default_transformations(&source, PipelineParams::default())
             .expect("pipeline should succeed");
 
-        assert_eq!(result.code, "exports.foo = 1;\n");
+        assert_eq!(result.code, "export const foo = 1;\n");
     }
 
     #[test]
