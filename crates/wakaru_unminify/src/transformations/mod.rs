@@ -84,7 +84,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("un-flip-comparisons", un_flip_comparisons::transform_ast),
     TransformationDescriptor::ast("un-iife", un_iife::transform_ast),
     TransformationDescriptor::ast("un-import-rename", un_import_rename::transform_ast),
-    TransformationDescriptor::ast("smart-inline", pending_ast_transform),
+    TransformationDescriptor::ast("smart-inline", smart_inline::transform_ast),
     TransformationDescriptor::ast("smart-rename", smart_rename::transform_ast),
     TransformationDescriptor::ast("un-optional-chaining", pending_ast_transform),
     TransformationDescriptor::ast("un-nullish-coalescing", pending_ast_transform),
