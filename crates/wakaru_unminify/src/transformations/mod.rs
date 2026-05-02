@@ -87,7 +87,10 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     TransformationDescriptor::ast("smart-inline", smart_inline::transform_ast),
     TransformationDescriptor::ast("smart-rename", smart_rename::transform_ast),
     TransformationDescriptor::ast("un-optional-chaining", un_optional_chaining::transform_ast),
-    TransformationDescriptor::ast("un-nullish-coalescing", pending_ast_transform),
+    TransformationDescriptor::ast(
+        "un-nullish-coalescing",
+        un_nullish_coalescing::transform_ast,
+    ),
     TransformationDescriptor::ast("un-conditionals", pending_ast_transform),
     TransformationDescriptor::ast(
         "un-sequence-expression",

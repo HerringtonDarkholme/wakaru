@@ -1,1 +1,369 @@
+use std::collections::HashSet;
 
+use oxc_allocator::{CloneIn, TakeIn};
+use oxc_ast::{
+    ast::{
+        AssignmentExpression, AssignmentTarget, BindingPattern, ConditionalExpression, Expression,
+        Statement,
+    },
+    AstBuilder,
+};
+use oxc_ast_visit::{walk_mut, VisitMut};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator};
+use wakaru_core::diagnostics::Result;
+use wakaru_core::source::ParsedSourceFile;
+
+pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
+    let mut transformer = NullishCoalescingTransformer {
+        ast: AstBuilder::new(source.allocator),
+        unused_temps: HashSet::new(),
+    };
+
+    transformer.visit_program(&mut source.program);
+
+    Ok(())
+}
+
+struct NullishCoalescingTransformer<'a> {
+    ast: AstBuilder<'a>,
+    unused_temps: HashSet<String>,
+}
+
+impl<'a> VisitMut<'a> for NullishCoalescingTransformer<'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+
+        if let Some(replacement) = self.convert_conditional_expression(expression) {
+            *expression = replacement;
+        }
+    }
+
+    fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
+        self.remove_unused_temp_declarations(statements);
+    }
+}
+
+impl<'a> NullishCoalescingTransformer<'a> {
+    fn convert_conditional_expression(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<Expression<'a>> {
+        let Expression::ConditionalExpression(conditional) = expression else {
+            return None;
+        };
+
+        let guard = nullish_guard(conditional)?;
+        let target = match guard {
+            NullishGuard::Direct(target) => target,
+            NullishGuard::Temp { name, target } => {
+                self.unused_temps.insert(name.to_string());
+                target
+            }
+        };
+
+        Some(self.ast.expression_logical(
+            conditional.span,
+            target.clone_in(self.ast.allocator),
+            LogicalOperator::Coalesce,
+            conditional.alternate.clone_in(self.ast.allocator),
+        ))
+    }
+
+    fn remove_unused_temp_declarations(
+        &self,
+        statements: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+    ) {
+        if self.unused_temps.is_empty() {
+            return;
+        }
+
+        let old_statements = statements.take_in(self.ast);
+        let mut new_statements = self.ast.vec_with_capacity(old_statements.len());
+
+        for statement in old_statements {
+            if let Some(statement) = self.remove_unused_temp_declaration(statement) {
+                new_statements.push(statement);
+            }
+        }
+
+        *statements = new_statements;
+    }
+
+    fn remove_unused_temp_declaration(&self, statement: Statement<'a>) -> Option<Statement<'a>> {
+        let Statement::VariableDeclaration(mut declaration) = statement else {
+            return Some(statement);
+        };
+
+        if !declaration
+            .declarations
+            .iter()
+            .any(|declarator| unused_temp_declarator(declarator, &self.unused_temps))
+        {
+            return Some(Statement::VariableDeclaration(declaration));
+        }
+
+        let old_declarations = declaration.declarations.take_in(self.ast);
+        let mut new_declarations = self.ast.vec_with_capacity(old_declarations.len());
+
+        for declarator in old_declarations {
+            if !unused_temp_declarator(&declarator, &self.unused_temps) {
+                new_declarations.push(declarator);
+            }
+        }
+
+        if new_declarations.is_empty() {
+            None
+        } else {
+            declaration.declarations = new_declarations;
+            Some(Statement::VariableDeclaration(declaration))
+        }
+    }
+}
+
+enum NullishGuard<'a, 'b> {
+    Direct(&'b Expression<'a>),
+    Temp {
+        name: &'b str,
+        target: &'b Expression<'a>,
+    },
+}
+
+fn nullish_guard<'a, 'b>(
+    conditional: &'b ConditionalExpression<'a>,
+) -> Option<NullishGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(&conditional.test) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::And {
+        return None;
+    }
+
+    let null_checked = non_null_check(without_parentheses(&logical.left))?;
+    let undefined_checked = non_undefined_check(without_parentheses(&logical.right))?;
+
+    match (null_checked, undefined_checked) {
+        (CheckedExpression::Direct(left_target), CheckedExpression::Direct(right_target))
+            if expressions_equal(left_target, right_target)
+                && expressions_equal(left_target, &conditional.consequent) =>
+        {
+            Some(NullishGuard::Direct(left_target))
+        }
+        (CheckedExpression::Temp { name, target }, CheckedExpression::Direct(right_target))
+            if identifier_name(right_target) == Some(name)
+                && identifier_name(&conditional.consequent) == Some(name) =>
+        {
+            Some(NullishGuard::Temp { name, target })
+        }
+        _ => None,
+    }
+}
+
+enum CheckedExpression<'a, 'b> {
+    Direct(&'b Expression<'a>),
+    Temp {
+        name: &'b str,
+        target: &'b Expression<'a>,
+    },
+}
+
+fn non_null_check<'a, 'b>(expression: &'b Expression<'a>) -> Option<CheckedExpression<'a, 'b>> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_inequality_operator(binary.operator) {
+        return None;
+    }
+
+    if let Some(result) = compared_to_null(&binary.left, &binary.right) {
+        return Some(result);
+    }
+    compared_to_null(&binary.right, &binary.left)
+}
+
+fn compared_to_null<'a, 'b>(
+    candidate: &'b Expression<'a>,
+    maybe_null: &Expression<'a>,
+) -> Option<CheckedExpression<'a, 'b>> {
+    if !matches!(without_parentheses(maybe_null), Expression::NullLiteral(_)) {
+        return None;
+    }
+
+    if let Expression::AssignmentExpression(assignment) = without_parentheses(candidate) {
+        let (name, target) = assignment_target(assignment)?;
+        return Some(CheckedExpression::Temp { name, target });
+    }
+
+    Some(CheckedExpression::Direct(candidate))
+}
+
+fn non_undefined_check<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<CheckedExpression<'a, 'b>> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_inequality_operator(binary.operator) {
+        return None;
+    }
+
+    if is_undefined_expression(&binary.right) {
+        return Some(CheckedExpression::Direct(&binary.left));
+    }
+    if is_undefined_expression(&binary.left) {
+        return Some(CheckedExpression::Direct(&binary.right));
+    }
+
+    None
+}
+
+fn assignment_target<'a, 'b>(
+    assignment: &'b AssignmentExpression<'a>,
+) -> Option<(&'b str, &'b Expression<'a>)> {
+    if assignment.operator != AssignmentOperator::Assign {
+        return None;
+    }
+
+    let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left else {
+        return None;
+    };
+
+    Some((identifier.name.as_str(), &assignment.right))
+}
+
+fn expressions_equal(left: &Expression, right: &Expression) -> bool {
+    match (without_parentheses(left), without_parentheses(right)) {
+        (Expression::Identifier(left), Expression::Identifier(right)) => left.name == right.name,
+        (Expression::ThisExpression(_), Expression::ThisExpression(_)) => true,
+        (Expression::StaticMemberExpression(left), Expression::StaticMemberExpression(right)) => {
+            left.property.name == right.property.name
+                && expressions_equal(&left.object, &right.object)
+        }
+        (
+            Expression::ComputedMemberExpression(left),
+            Expression::ComputedMemberExpression(right),
+        ) => {
+            expressions_equal(&left.object, &right.object)
+                && expressions_equal(&left.expression, &right.expression)
+        }
+        (Expression::StringLiteral(left), Expression::StringLiteral(right)) => {
+            left.value == right.value
+        }
+        (Expression::NumericLiteral(left), Expression::NumericLiteral(right)) => {
+            left.value == right.value
+        }
+        _ => false,
+    }
+}
+
+fn identifier_name<'a>(expression: &'a Expression) -> Option<&'a str> {
+    let Expression::Identifier(identifier) = without_parentheses(expression) else {
+        return None;
+    };
+
+    Some(identifier.name.as_str())
+}
+
+fn is_inequality_operator(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Inequality | BinaryOperator::StrictInequality
+    )
+}
+
+fn is_undefined_expression(expression: &Expression) -> bool {
+    match without_parentheses(expression) {
+        Expression::Identifier(identifier) => identifier.name == "undefined",
+        Expression::UnaryExpression(unary) => {
+            unary.operator == UnaryOperator::Void && is_numeric_zero(&unary.argument)
+        }
+        _ => false,
+    }
+}
+
+fn is_numeric_zero(expression: &Expression) -> bool {
+    match without_parentheses(expression) {
+        Expression::NumericLiteral(literal) => literal.value == 0.0,
+        _ => false,
+    }
+}
+
+fn unused_temp_declarator(
+    declarator: &oxc_ast::ast::VariableDeclarator,
+    unused_temps: &HashSet<String>,
+) -> bool {
+    if declarator.init.is_some() {
+        return false;
+    }
+
+    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+        return false;
+    };
+
+    unused_temps.contains(identifier.name.as_str())
+}
+
+fn without_parentheses<'a, 'b>(expression: &'b Expression<'a>) -> &'b Expression<'a> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            without_parentheses(&parenthesized.expression)
+        }
+        _ => expression,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::define_ast_inline_test;
+
+    #[test]
+    fn restores_direct_nullish_coalescing() {
+        define_ast_inline_test(transform_ast)(
+            "
+foo !== null && foo !== void 0 ? foo : \"bar\";
+",
+            "
+foo ?? \"bar\";
+",
+        );
+    }
+
+    #[test]
+    fn restores_temp_assignment_nullish_coalescing() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _ref;
+(_ref = foo.bar) !== null && _ref !== void 0 ? _ref : \"qux\";
+",
+            "
+foo.bar ?? \"qux\";
+",
+        );
+    }
+
+    #[test]
+    fn supports_reversed_inequality_operands() {
+        define_ast_inline_test(transform_ast)(
+            "
+var e;
+null !== (e = m.foo) && void 0 !== e ? e : void 0;
+",
+            "
+m.foo ?? void 0;
+",
+        );
+    }
+
+    #[test]
+    fn leaves_mismatched_guards_unchanged() {
+        define_ast_inline_test(transform_ast)(
+            "
+foo !== null && bar !== void 0 ? foo : \"bar\";
+",
+            "
+foo !== null && bar !== void 0 ? foo : \"bar\";
+",
+        );
+    }
+}
