@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use oxc_allocator::{CloneIn, TakeIn};
 use oxc_ast::{
@@ -36,14 +36,23 @@ impl<'a> EnumTransformer<'a, '_> {
     fn transform_program(&mut self, program: &mut Program<'a>) {
         let old_body = program.body.take_in(self.ast);
         let mut new_body = self.ast.vec_with_capacity(old_body.len());
-        let mut old_body = old_body.into_iter().peekable();
+        let mut old_body: VecDeque<_> = old_body.into_iter().collect();
 
-        while let Some(statement) = old_body.next() {
+        while let Some(statement) = old_body.pop_front() {
             let statement =
-                match self.transform_variable_declaration_with_next(statement, old_body.peek()) {
+                match self.transform_compressed_swc_enum_with_front(statement, &mut old_body) {
                     Ok(transformed) => {
                         new_body.push(transformed);
-                        old_body.next();
+                        continue;
+                    }
+                    Err(statement) => statement,
+                };
+
+            let statement =
+                match self.transform_variable_declaration_with_next(statement, old_body.front()) {
+                    Ok(transformed) => {
+                        new_body.push(transformed);
+                        old_body.pop_front();
                         continue;
                     }
                     Err(statement) => statement,
@@ -87,6 +96,55 @@ impl<'a> EnumTransformer<'a, '_> {
         ) else {
             return Err(Statement::VariableDeclaration(declaration));
         };
+        declaration.declarations[0].init = Some(object);
+        self.mark_enum_seen(&enum_name);
+        Ok(Statement::VariableDeclaration(declaration))
+    }
+
+    fn transform_compressed_swc_enum_with_front(
+        &mut self,
+        statement: Statement<'a>,
+        rest: &mut VecDeque<Statement<'a>>,
+    ) -> std::result::Result<Statement<'a>, Statement<'a>> {
+        let Statement::VariableDeclaration(mut declaration) = statement else {
+            return Err(statement);
+        };
+
+        let Some(enum_name) = single_uninitialized_binding_name(&declaration) else {
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        let Some(alias_statement) = rest.front() else {
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        let Some(alias_name) = single_uninitialized_binding_name_from_statement(alias_statement)
+        else {
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        let Some(setup_statement) = rest.get(1) else {
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+        if !is_compressed_swc_alias_assignment(setup_statement, &alias_name, &enum_name) {
+            return Err(Statement::VariableDeclaration(declaration));
+        }
+
+        let should_add_spread = self.enum_counts.contains_key(&enum_name);
+        let Some((object, consumed_assignments)) = enum_object_from_compressed_assignments(
+            rest,
+            self.ast,
+            &alias_name,
+            &enum_name,
+            should_add_spread,
+            self.synthetic_replacements,
+        ) else {
+            return Err(Statement::VariableDeclaration(declaration));
+        };
+
+        rest.pop_front();
+        rest.pop_front();
+        for _ in 0..consumed_assignments {
+            rest.pop_front();
+        }
+
         declaration.declarations[0].init = Some(object);
         self.mark_enum_seen(&enum_name);
         Ok(Statement::VariableDeclaration(declaration))
@@ -182,11 +240,54 @@ fn single_uninitialized_binding_name(declaration: &VariableDeclaration) -> Optio
     Some(id.name.as_str().to_string())
 }
 
+fn single_uninitialized_binding_name_from_statement(statement: &Statement) -> Option<String> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return None;
+    };
+    single_uninitialized_binding_name(declaration)
+}
+
 fn iife_external_name<'b, 'a>(statement: &'b Statement<'a>) -> Option<&'b str> {
     let Statement::ExpressionStatement(statement) = statement else {
         return None;
     };
     iife_external_name_from_expression(&statement.expression)
+}
+
+fn is_compressed_swc_alias_assignment(
+    statement: &Statement,
+    alias_name: &str,
+    enum_name: &str,
+) -> bool {
+    let Some(assignment) = expression_statement_assignment(statement) else {
+        return false;
+    };
+    if assignment_target_identifier_name(&assignment.left) != Some(alias_name) {
+        return false;
+    }
+
+    let Expression::LogicalExpression(logical) = without_parentheses(&assignment.right) else {
+        return false;
+    };
+    if logical.operator != LogicalOperator::Or || identifier_name(&logical.left) != Some(enum_name)
+    {
+        return false;
+    }
+
+    let Expression::AssignmentExpression(fallback) = without_parentheses(&logical.right) else {
+        return false;
+    };
+    if fallback.operator != AssignmentOperator::Assign {
+        return false;
+    }
+    if assignment_target_identifier_name(&fallback.left) != Some(enum_name) {
+        return false;
+    }
+
+    matches!(
+        without_parentheses(&fallback.right),
+        Expression::ObjectExpression(object) if object.properties.is_empty()
+    )
 }
 
 fn iife_external_name_from_expression<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b str> {
@@ -295,6 +396,62 @@ fn enum_object_from_expression_iife<'a>(
     properties.extend(reverse_properties);
 
     Some(ast.expression_object(Span::default(), properties))
+}
+
+fn enum_object_from_compressed_assignments<'a>(
+    statements: &VecDeque<Statement<'a>>,
+    ast: AstBuilder<'a>,
+    alias_name: &str,
+    enum_name: &str,
+    should_add_spread: bool,
+    synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
+) -> Option<(Expression<'a>, usize)> {
+    let mut forward_properties = ast.vec();
+    let mut reverse_properties = ast.vec();
+    let mut consumed_assignments = 0;
+
+    for statement in statements.iter().skip(2) {
+        let Some(assignment) = expression_statement_assignment(statement) else {
+            break;
+        };
+        let Some(right_name) = string_literal_value(&assignment.right) else {
+            break;
+        };
+
+        if let Some(property) = direct_string_enum_property(assignment, ast, alias_name, right_name)
+        {
+            forward_properties.push(property);
+            consumed_assignments += 1;
+            continue;
+        }
+
+        if let Some((forward_property, reverse_property)) =
+            numeric_enum_properties(assignment, ast, alias_name, right_name)
+        {
+            forward_properties.push(forward_property);
+            reverse_properties.push(reverse_property);
+            consumed_assignments += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    if forward_properties.is_empty() {
+        return None;
+    }
+
+    let mut properties = ast.vec();
+    if should_add_spread {
+        properties.push(enum_spread_property(ast, enum_name, synthetic_replacements));
+    }
+    properties.extend(forward_properties);
+    properties.extend(reverse_properties);
+
+    Some((
+        ast.expression_object(Span::default(), properties),
+        consumed_assignments,
+    ))
 }
 
 fn iife_call_expression<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b CallExpression<'a>> {
@@ -581,6 +738,13 @@ fn assignment_statement<'a>(
     ast.statement_expression(Span::default(), expression)
 }
 
+fn assignment_target_identifier_name<'b, 'a>(target: &'b AssignmentTarget<'a>) -> Option<&'b str> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
 fn identifier_name<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b str> {
     match without_parentheses(expression) {
         Expression::Identifier(identifier) => Some(identifier.name.as_str()),
@@ -752,6 +916,26 @@ var Direction = {
   ...(Direction || {}),
   Left: \"LEFT\",
   Right: \"RIGHT\"
+};
+",
+        );
+    }
+
+    #[test]
+    fn handles_swc_compressed_assignment_form() {
+        define_ast_inline_test(transform_ast)(
+            "
+var Direction;
+var Direction1;
+Direction1 = Direction || (Direction = {});
+Direction1[Direction1.Up = 1] = \"Up\";
+Direction1.Down = \"DOWN\";
+",
+            "
+var Direction = {
+  Up: 1,
+  Down: \"DOWN\",
+  1: \"Up\"
 };
 ",
         );

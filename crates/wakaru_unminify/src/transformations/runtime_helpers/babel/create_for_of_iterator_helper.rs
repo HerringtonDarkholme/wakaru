@@ -171,9 +171,19 @@ impl<'a> CreateForOfIteratorHelperRestorer<'a> {
         let Some(step_name) = find_step_assignment(test, &helper_match.iterator_name, false) else {
             return Err((declaration, step_declaration, try_statement));
         };
-        let Some(result_plan) = match_result_plan(&for_statement.body, &step_name) else {
-            return Err((declaration, step_declaration, try_statement));
-        };
+        let body_plan =
+            if let Some(result_plan) = match_result_plan(&for_statement.body, &step_name) {
+                BodyPlan::Direct(result_plan)
+            } else if let Some(loop_plan) = match_loop_function_body_plan(
+                &try_statement.block.body,
+                for_index,
+                for_statement,
+                &step_name,
+            ) {
+                BodyPlan::LoopFunction(loop_plan)
+            } else {
+                return Err((declaration, step_declaration, try_statement));
+            };
 
         let object = self.take_helper_object(&mut declaration, helper_match.helper_index);
         let Some(object) = object else {
@@ -185,29 +195,38 @@ impl<'a> CreateForOfIteratorHelperRestorer<'a> {
             self.remove_iterator_declarators(declaration, &helper_match.iterator_name, &step_name)
         });
 
-        let Statement::ForStatement(mut for_statement) = try_statement
-            .block
-            .body
-            .take_in(self.ast)
-            .into_iter()
-            .nth(for_index)
-            .expect("validated for statement index")
-        else {
-            return Err((
-                kept_declaration.unwrap_or_else(|| {
-                    self.ast.alloc_variable_declaration(
-                        Span::default(),
-                        VariableDeclarationKind::Var,
-                        self.ast.vec(),
-                        false,
-                    )
-                }),
-                kept_step_declaration,
-                try_statement,
-            ));
+        let rebuilt = match body_plan {
+            BodyPlan::Direct(result_plan) => {
+                let Statement::ForStatement(mut for_statement) = try_statement
+                    .block
+                    .body
+                    .take_in(self.ast)
+                    .into_iter()
+                    .nth(for_index)
+                    .expect("validated for statement index")
+                else {
+                    return Err((
+                        kept_declaration.unwrap_or_else(|| {
+                            self.ast.alloc_variable_declaration(
+                                Span::default(),
+                                VariableDeclarationKind::Var,
+                                self.ast.vec(),
+                                false,
+                            )
+                        }),
+                        kept_step_declaration,
+                        try_statement,
+                    ));
+                };
+
+                self.rebuild_for_body(&mut for_statement.body, result_plan)
+            }
+            BodyPlan::LoopFunction(loop_plan) => {
+                self.rebuild_loop_function_body(&mut try_statement, loop_plan)
+            }
         };
 
-        let Some((left, body)) = self.rebuild_for_body(&mut for_statement.body, result_plan) else {
+        let Some((left, body, body_span)) = rebuilt else {
             return Err((
                 kept_declaration.unwrap_or_else(|| {
                     self.ast.alloc_variable_declaration(
@@ -232,7 +251,7 @@ impl<'a> CreateForOfIteratorHelperRestorer<'a> {
             false,
             left,
             object,
-            self.ast.statement_block(for_statement.body.span(), body),
+            self.ast.statement_block(body_span, body),
         );
         let mut kept_declarations = self.ast.vec();
         if let Some(declaration) = kept_declaration {
@@ -275,7 +294,9 @@ impl<'a> CreateForOfIteratorHelperRestorer<'a> {
         else {
             return Err(for_statement);
         };
-        let Some((left, body)) = self.rebuild_for_body(&mut for_statement.body, result_plan) else {
+        let Some((left, body, _body_span)) =
+            self.rebuild_for_body(&mut for_statement.body, result_plan)
+        else {
             return Err(for_statement);
         };
 
@@ -373,12 +394,69 @@ impl<'a> CreateForOfIteratorHelperRestorer<'a> {
         &self,
         body: &mut Statement<'a>,
         result_plan: ResultPlan,
-    ) -> Option<(ForStatementLeft<'a>, oxc_allocator::Vec<'a, Statement<'a>>)> {
+    ) -> Option<(
+        ForStatementLeft<'a>,
+        oxc_allocator::Vec<'a, Statement<'a>>,
+        Span,
+    )> {
         let Statement::BlockStatement(block) = body else {
             return None;
         };
 
+        let body_span = block.span;
         let old_body = block.body.take_in(self.ast);
+        let (left, body) = self.rebuild_statements(old_body, result_plan)?;
+        Some((left, body, body_span))
+    }
+
+    fn rebuild_loop_function_body(
+        &self,
+        try_statement: &mut oxc_allocator::Box<'a, oxc_ast::ast::TryStatement<'a>>,
+        loop_plan: LoopFunctionPlan,
+    ) -> Option<(
+        ForStatementLeft<'a>,
+        oxc_allocator::Vec<'a, Statement<'a>>,
+        Span,
+    )> {
+        let old_try_body = try_statement.block.body.take_in(self.ast);
+
+        for (statement_index, statement) in old_try_body.into_iter().enumerate() {
+            if statement_index != loop_plan.statement_index {
+                continue;
+            }
+
+            let Statement::VariableDeclaration(mut declaration) = statement else {
+                return None;
+            };
+            let old_declarations = declaration.declarations.take_in(self.ast);
+
+            for mut declarator in old_declarations {
+                if binding_identifier_name(&declarator) != Some(loop_plan.loop_name.as_str()) {
+                    continue;
+                }
+
+                let Some(Expression::FunctionExpression(mut function)) = declarator.init.take()
+                else {
+                    return None;
+                };
+                let body = function.body.as_mut()?;
+                let body_span = body.span;
+                let old_body = body.statements.take_in(self.ast);
+                let (left, body) = self.rebuild_statements(old_body, loop_plan.result_plan)?;
+                return Some((left, body, body_span));
+            }
+
+            return None;
+        }
+
+        None
+    }
+
+    fn rebuild_statements(
+        &self,
+        old_body: oxc_allocator::Vec<'a, Statement<'a>>,
+        result_plan: ResultPlan,
+    ) -> Option<(ForStatementLeft<'a>, oxc_allocator::Vec<'a, Statement<'a>>)> {
         let mut new_body = self.ast.vec_with_capacity(old_body.len());
         let mut left = None;
         let mut prepend = None;
@@ -476,6 +554,17 @@ enum ResultPlan {
     },
 }
 
+enum BodyPlan {
+    Direct(ResultPlan),
+    LoopFunction(LoopFunctionPlan),
+}
+
+struct LoopFunctionPlan {
+    statement_index: usize,
+    loop_name: String,
+    result_plan: ResultPlan,
+}
+
 fn find_for_statement_index(statements: &oxc_allocator::Vec<Statement>) -> Option<usize> {
     statements
         .iter()
@@ -539,8 +628,15 @@ fn match_result_plan(body: &Statement, step_name: &str) -> Option<ResultPlan> {
         return None;
     };
 
+    match_result_plan_in_statements(&block.body, step_name)
+}
+
+fn match_result_plan_in_statements(
+    statements: &oxc_allocator::Vec<Statement>,
+    step_name: &str,
+) -> Option<ResultPlan> {
     let mut result_plan = None;
-    for (statement_index, statement) in block.body.iter().enumerate() {
+    for (statement_index, statement) in statements.iter().enumerate() {
         match statement {
             Statement::VariableDeclaration(declaration) => {
                 for (declarator_index, declarator) in declaration.declarations.iter().enumerate() {
@@ -579,6 +675,74 @@ fn match_result_plan(body: &Statement, step_name: &str) -> Option<ResultPlan> {
     }
 
     result_plan
+}
+
+fn match_loop_function_body_plan(
+    statements: &oxc_allocator::Vec<Statement>,
+    for_index: usize,
+    for_statement: &oxc_ast::ast::ForStatement,
+    step_name: &str,
+) -> Option<LoopFunctionPlan> {
+    let loop_name = loop_call_name(&for_statement.body)?.to_string();
+
+    for (statement_index, statement) in statements.iter().take(for_index).enumerate().rev() {
+        if let Some(function_body) = loop_function_body(statement, &loop_name) {
+            let result_plan =
+                match_result_plan_in_statements(&function_body.statements, step_name)?;
+            return Some(LoopFunctionPlan {
+                statement_index,
+                loop_name,
+                result_plan,
+            });
+        }
+    }
+
+    None
+}
+
+fn loop_call_name<'a>(body: &'a Statement<'a>) -> Option<&'a str> {
+    let Statement::BlockStatement(block) = body else {
+        return None;
+    };
+    if block.body.len() != 1 {
+        return None;
+    }
+
+    let Statement::ExpressionStatement(expression_statement) = &block.body[0] else {
+        return None;
+    };
+    let Expression::CallExpression(call) = &expression_statement.expression else {
+        return None;
+    };
+    if !call.arguments.is_empty() {
+        return None;
+    }
+    let Expression::Identifier(callee) = &call.callee else {
+        return None;
+    };
+
+    Some(callee.name.as_str())
+}
+
+fn loop_function_body<'b, 'a>(
+    statement: &'b Statement<'a>,
+    loop_name: &str,
+) -> Option<&'b oxc_ast::ast::FunctionBody<'a>> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return None;
+    };
+
+    for declarator in &declaration.declarations {
+        if binding_identifier_name(declarator) != Some(loop_name) {
+            continue;
+        }
+        let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+            return None;
+        };
+        return function.body.as_deref();
+    }
+
+    None
 }
 
 fn is_step_value_member(expression: &Expression, step_name: &str) -> bool {
@@ -921,6 +1085,43 @@ for (var _result of arr) {}
     }
 
     #[test]
+    fn extracts_standard_loop_function_body() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+var _createForOfIteratorHelper = require("@babel/runtime/helpers/createForOfIteratorHelper");
+
+var _iterator = _createForOfIteratorHelper(arr), _step;
+try {
+  var _loop = function _loop() {
+    var _result = _step.value;
+    var a = _result[0];
+    a = 1;
+    (function () {
+      return a;
+    });
+  };
+  for (_iterator.s(); !(_step = _iterator.n()).done;) {
+    _loop();
+  }
+} catch (err) {
+  _iterator.e(err);
+} finally {
+  _iterator.f();
+}
+"#,
+            "
+for (var _result of arr) {
+  var a = _result[0];
+  a = 1;
+  (function() {
+    return a;
+  });
+}
+",
+        );
+    }
+
+    #[test]
     fn restores_loose_create_for_of_iterator_helper() {
         define_ast_inline_test(transform_ast)(
             r#"
@@ -948,6 +1149,47 @@ for (var result of results) {
   _loop(result);
 }
 ",
+        );
+    }
+
+    #[test]
+    fn leaves_unmatched_loop_function_wrapper_unchanged() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+var _createForOfIteratorHelper = require("@babel/runtime/helpers/createForOfIteratorHelper");
+
+var _iterator = _createForOfIteratorHelper(arr), _step;
+try {
+  var _loop = function _loop() {
+    var _result = other.value;
+    use(_result);
+  };
+  for (_iterator.s(); !(_step = _iterator.n()).done;) {
+    _loop();
+  }
+} catch (err) {
+  _iterator.e(err);
+} finally {
+  _iterator.f();
+}
+"#,
+            r#"
+var _createForOfIteratorHelper = require("@babel/runtime/helpers/createForOfIteratorHelper");
+var _iterator = _createForOfIteratorHelper(arr), _step;
+try {
+  var _loop = function _loop() {
+    var _result = other.value;
+    use(_result);
+  };
+  for (_iterator.s(); !(_step = _iterator.n()).done;) {
+    _loop();
+  }
+} catch (err) {
+  _iterator.e(err);
+} finally {
+  _iterator.f();
+}
+"#,
         );
     }
 

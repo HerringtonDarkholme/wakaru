@@ -1,6 +1,6 @@
 use oxc_allocator::{CloneIn, TakeIn};
 use oxc_ast::{
-    ast::{Expression, LogicalExpression, Statement},
+    ast::{ConditionalExpression, Expression, ExpressionStatement, LogicalExpression, Statement},
     AstBuilder,
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
@@ -31,7 +31,9 @@ impl<'a> VisitMut<'a> for ConditionalRenderer<'a> {
         let mut new_statements = self.ast.vec_with_capacity(old_statements.len());
 
         for statement in old_statements {
-            new_statements.push(self.render_statement(statement));
+            for replacement in self.render_statement(statement) {
+                new_statements.push(replacement);
+            }
         }
 
         *statements = new_statements;
@@ -39,11 +41,32 @@ impl<'a> VisitMut<'a> for ConditionalRenderer<'a> {
 }
 
 impl<'a> ConditionalRenderer<'a> {
-    fn render_statement(&self, statement: Statement<'a>) -> Statement<'a> {
-        let Statement::ExpressionStatement(expression_statement) = statement else {
-            return statement;
-        };
+    fn render_statement(&self, statement: Statement<'a>) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        match statement {
+            Statement::ExpressionStatement(expression_statement) => {
+                self.single(self.render_expression_statement(expression_statement.unbox()))
+            }
+            Statement::ReturnStatement(return_statement) => {
+                let Some(Expression::ConditionalExpression(conditional)) =
+                    &return_statement.argument
+                else {
+                    return self.single(Statement::ReturnStatement(return_statement));
+                };
 
+                if should_render_return_conditional(conditional) {
+                    self.render_return_conditional(conditional)
+                } else {
+                    self.single(Statement::ReturnStatement(return_statement))
+                }
+            }
+            statement => self.single(statement),
+        }
+    }
+
+    fn render_expression_statement(
+        &self,
+        expression_statement: ExpressionStatement<'a>,
+    ) -> Statement<'a> {
         let span = expression_statement.span;
         match &expression_statement.expression {
             Expression::ConditionalExpression(conditional)
@@ -69,11 +92,54 @@ impl<'a> ConditionalRenderer<'a> {
                     Some(alternate),
                 )
             }
-            Expression::LogicalExpression(logical) => self
-                .render_logical_expression_statement(span, logical)
-                .unwrap_or(Statement::ExpressionStatement(expression_statement)),
-            _ => Statement::ExpressionStatement(expression_statement),
+            Expression::LogicalExpression(logical) => {
+                if let Some(statement) = self.render_logical_expression_statement(span, logical) {
+                    statement
+                } else {
+                    self.ast
+                        .statement_expression(span, expression_statement.expression)
+                }
+            }
+            _ => self
+                .ast
+                .statement_expression(span, expression_statement.expression),
         }
+    }
+
+    fn render_return_conditional(
+        &self,
+        conditional: &ConditionalExpression<'a>,
+    ) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        let true_branch = self.render_return_expression(&conditional.consequent);
+        let false_branch = self.render_return_expression(&conditional.alternate);
+
+        let mut statements = self.ast.vec_with_capacity(1 + false_branch.len());
+        statements.push(self.ast.statement_if(
+            conditional.span,
+            conditional.test.clone_in(self.ast.allocator),
+            self.block_statement_from_body(conditional.consequent.span(), true_branch),
+            None,
+        ));
+
+        for statement in false_branch {
+            statements.push(statement);
+        }
+
+        statements
+    }
+
+    fn render_return_expression(
+        &self,
+        expression: &Expression<'a>,
+    ) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        if let Expression::ConditionalExpression(conditional) = expression {
+            return self.render_return_conditional(conditional);
+        };
+
+        self.single(self.ast.statement_return(
+            expression.span(),
+            Some(expression.clone_in(self.ast.allocator)),
+        ))
     }
 
     fn render_logical_expression_statement(
@@ -122,6 +188,43 @@ impl<'a> ConditionalRenderer<'a> {
         build(&mut body);
         self.ast.statement_block(span, body)
     }
+
+    fn block_statement_from_body(
+        &self,
+        span: Span,
+        body: oxc_allocator::Vec<'a, Statement<'a>>,
+    ) -> Statement<'a> {
+        self.ast.statement_block(span, body)
+    }
+
+    fn single(&self, statement: Statement<'a>) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        let mut statements = self.ast.vec_with_capacity(1);
+        statements.push(statement);
+        statements
+    }
+}
+
+fn should_render_return_conditional(conditional: &ConditionalExpression) -> bool {
+    has_conditional_branch(conditional)
+        && should_render_return_expression(&conditional.consequent)
+        && should_render_return_expression(&conditional.alternate)
+}
+
+fn should_render_return_expression(expression: &Expression) -> bool {
+    match expression {
+        Expression::ConditionalExpression(conditional) => {
+            should_render_return_expression(&conditional.consequent)
+                && should_render_return_expression(&conditional.alternate)
+        }
+        expression => should_render_leaf(expression),
+    }
+}
+
+fn has_conditional_branch(conditional: &ConditionalExpression) -> bool {
+    matches!(
+        &conditional.consequent,
+        Expression::ConditionalExpression(_)
+    ) || matches!(&conditional.alternate, Expression::ConditionalExpression(_))
 }
 
 fn should_render_leaf(expression: &Expression) -> bool {
@@ -199,6 +302,44 @@ x && 1;
 x ? a : b;
 x ? 1 : 2;
 x && 1;
+",
+        );
+    }
+
+    #[test]
+    fn renders_nested_ternary_return_as_early_returns() {
+        define_ast_inline_test(transform_ast)(
+            "
+function fn() {
+  return a ? b() : c ? d() : e();
+}
+",
+            "
+function fn() {
+  if (a) {
+    return b();
+  }
+  if (c) {
+    return d();
+  }
+  return e();
+}
+",
+        );
+    }
+
+    #[test]
+    fn leaves_simple_ternary_return_unchanged() {
+        define_ast_inline_test(transform_ast)(
+            "
+function fn() {
+  return x ? a() : b();
+}
+",
+            "
+function fn() {
+  return x ? a() : b();
+}
 ",
         );
     }

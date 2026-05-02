@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use oxc_allocator::{CloneIn, TakeIn};
 use oxc_ast::{
     ast::{
-        AssignmentExpression, AssignmentTarget, BindingPattern, ConditionalExpression, Expression,
-        Statement,
+        Argument, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression,
+        ConditionalExpression, Expression, Statement,
     },
     AstBuilder,
 };
@@ -55,9 +55,10 @@ impl<'a> OptionalChainingTransformer<'a> {
         };
 
         let (temp_name, target) = optional_member_guard(conditional)?;
-        let replacement = self.optional_member_expression(
+        let replacement = self.optional_chain_expression(
             conditional.span,
             target,
+            temp_name,
             without_parentheses(&conditional.alternate),
         )?;
 
@@ -65,10 +66,11 @@ impl<'a> OptionalChainingTransformer<'a> {
         Some(replacement)
     }
 
-    fn optional_member_expression(
+    fn optional_chain_expression(
         &self,
         span: Span,
         object: &Expression<'a>,
+        temp_name: &str,
         member: &Expression<'a>,
     ) -> Option<Expression<'a>> {
         let expression = match without_parentheses(member) {
@@ -88,9 +90,102 @@ impl<'a> OptionalChainingTransformer<'a> {
                     true,
                 ))
             }
+            Expression::CallExpression(call) => {
+                return self.optional_call_expression(span, object, temp_name, call);
+            }
             _ => return None,
         };
 
+        let chain_element = expression.into_chain_element()?;
+        Some(self.ast.expression_chain(span, chain_element))
+    }
+
+    fn optional_call_expression(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        match without_parentheses(&call.callee) {
+            Expression::Identifier(identifier) if identifier.name == temp_name => {
+                self.optional_call(span, target.clone_in(self.ast.allocator), call, 0, true)
+            }
+            Expression::StaticMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                if member.property.name == "call" {
+                    return self.optional_call_method(span, target, call);
+                }
+
+                if matches!(member.property.name.as_str(), "apply" | "bind") {
+                    return None;
+                }
+
+                let callee =
+                    Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
+                        member.span,
+                        target.clone_in(self.ast.allocator),
+                        member.property.clone_in(self.ast.allocator),
+                        true,
+                    ));
+                self.optional_call(span, callee, call, 0, false)
+            }
+            Expression::ComputedMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                let callee = Expression::ComputedMemberExpression(
+                    self.ast.alloc_computed_member_expression(
+                        member.span,
+                        target.clone_in(self.ast.allocator),
+                        member.expression.clone_in(self.ast.allocator),
+                        true,
+                    ),
+                );
+                self.optional_call(span, callee, call, 0, false)
+            }
+            _ => None,
+        }
+    }
+
+    fn optional_call_method(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let first_argument = call.arguments.first()?;
+        let expected_this = call_this_expression(target);
+        if !argument_matches_expression(first_argument, expected_this) {
+            return None;
+        }
+
+        self.optional_call(span, target.clone_in(self.ast.allocator), call, 1, true)
+    }
+
+    fn optional_call(
+        &self,
+        span: Span,
+        callee: Expression<'a>,
+        call: &CallExpression<'a>,
+        skip_arguments: usize,
+        optional: bool,
+    ) -> Option<Expression<'a>> {
+        let mut arguments = self
+            .ast
+            .vec_with_capacity(call.arguments.len().saturating_sub(skip_arguments));
+        for argument in call.arguments.iter().skip(skip_arguments) {
+            arguments.push(argument.clone_in(self.ast.allocator));
+        }
+
+        let expression = Expression::CallExpression(self.ast.alloc_call_expression_with_pure(
+            call.span,
+            callee,
+            call.type_arguments.clone_in(self.ast.allocator),
+            arguments,
+            optional,
+            call.pure,
+        ));
         let chain_element = expression.into_chain_element()?;
         Some(self.ast.expression_chain(span, chain_element))
     }
@@ -166,10 +261,6 @@ fn optional_member_guard<'a, 'b>(
         return None;
     }
 
-    if !member_object_is_identifier(without_parentheses(&conditional.alternate), temp_name) {
-        return None;
-    }
-
     Some((temp_name, target))
 }
 
@@ -229,16 +320,6 @@ fn identifier_nullish_check(expression: &Expression, name: &str) -> bool {
         || (identifier_name(&binary.right) == Some(name) && is_undefined_expression(&binary.left))
 }
 
-fn member_object_is_identifier(expression: &Expression, name: &str) -> bool {
-    match expression {
-        Expression::StaticMemberExpression(member) => identifier_name(&member.object) == Some(name),
-        Expression::ComputedMemberExpression(member) => {
-            identifier_name(&member.object) == Some(name)
-        }
-        _ => false,
-    }
-}
-
 fn identifier_name<'a>(expression: &'a Expression) -> Option<&'a str> {
     let Expression::Identifier(identifier) = without_parentheses(expression) else {
         return None;
@@ -252,6 +333,41 @@ fn is_equality_operator(operator: BinaryOperator) -> bool {
         operator,
         BinaryOperator::Equality | BinaryOperator::StrictEquality
     )
+}
+
+fn call_this_expression<'a, 'b>(target: &'b Expression<'a>) -> &'b Expression<'a> {
+    match without_parentheses(target) {
+        Expression::StaticMemberExpression(member) => without_parentheses(&member.object),
+        Expression::ComputedMemberExpression(member) => without_parentheses(&member.object),
+        _ => without_parentheses(target),
+    }
+}
+
+fn argument_matches_expression(argument: &Argument, expression: &Expression) -> bool {
+    let Some(argument) = argument.as_expression() else {
+        return false;
+    };
+
+    expressions_match(argument, expression)
+}
+
+fn expressions_match(left: &Expression, right: &Expression) -> bool {
+    match (without_parentheses(left), without_parentheses(right)) {
+        (Expression::Identifier(left), Expression::Identifier(right)) => left.name == right.name,
+        (Expression::ThisExpression(_), Expression::ThisExpression(_)) => true,
+        (Expression::StaticMemberExpression(left), Expression::StaticMemberExpression(right)) => {
+            left.property.name == right.property.name
+                && expressions_match(&left.object, &right.object)
+        }
+        (
+            Expression::ComputedMemberExpression(left),
+            Expression::ComputedMemberExpression(right),
+        ) => {
+            expressions_match(&left.object, &right.object)
+                && expressions_match(&left.expression, &right.expression)
+        }
+        _ => false,
+    }
 }
 
 fn is_undefined_expression(expression: &Expression) -> bool {
@@ -322,6 +438,45 @@ var _a;
 ",
             "
 a?.[0];
+",
+        );
+    }
+
+    #[test]
+    fn restores_optional_function_call() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo;
+(_foo = foo) === null || _foo === void 0 ? void 0 : _foo(bar);
+",
+            "
+foo?.(bar);
+",
+        );
+    }
+
+    #[test]
+    fn restores_optional_member_call() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo;
+(_foo = foo) === null || _foo === void 0 ? void 0 : _foo.bar(baz);
+",
+            "
+foo?.bar(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_call_method_optional_call() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo_bar;
+(_foo_bar = foo.bar) === null || _foo_bar === void 0 ? void 0 : _foo_bar.call(foo, baz);
+",
+            "
+foo.bar?.(baz);
 ",
         );
     }

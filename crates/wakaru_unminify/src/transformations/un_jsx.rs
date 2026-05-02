@@ -60,6 +60,15 @@ impl<'a> JsxTransformer<'a> {
         }
 
         let span = call.span;
+        if attributes.is_empty() && is_fragment_tag(&tag) {
+            return Some(Expression::JSXFragment(self.ast.alloc_jsx_fragment(
+                span,
+                self.ast.jsx_opening_fragment(span),
+                children,
+                self.ast.jsx_closing_fragment(span),
+            )));
+        }
+
         let closing_element = if children.is_empty() {
             None
         } else {
@@ -274,6 +283,15 @@ fn capitalization_invalid(tag: &JSXElementName) -> bool {
             .chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_lowercase()),
+        _ => false,
+    }
+}
+
+fn is_fragment_tag(tag: &JSXElementName) -> bool {
+    match tag {
+        JSXElementName::Identifier(identifier) => identifier.name == "Fragment",
+        JSXElementName::IdentifierReference(identifier) => identifier.name == "Fragment",
+        JSXElementName::MemberExpression(member) => member.property.name == "Fragment",
         _ => false,
     }
 }
@@ -528,6 +546,32 @@ React.createElement("div", wrap(props));
 <Button variant="contained">Hello</Button>;
 <mui.Button {...props} foo="bar" />;
 <div {...wrap(props)} />;
+"#,
+        );
+    }
+
+    #[test]
+    fn restores_classic_fragments_without_attributes() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+React.createElement(React.Fragment, null, React.createElement("span", null, "Hello"));
+React.createElement(Fragment, null, "World");
+"#,
+            r#"
+<><span>Hello</span></>;
+<>World</>;
+"#,
+        );
+    }
+
+    #[test]
+    fn keeps_fragment_component_when_attributes_are_present() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+React.createElement(React.Fragment, { key: "a" }, React.createElement("span", null));
+"#,
+            r#"
+<React.Fragment key="a"><span /></React.Fragment>;
 "#,
         );
     }

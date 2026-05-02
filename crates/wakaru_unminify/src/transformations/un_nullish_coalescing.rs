@@ -35,6 +35,11 @@ impl<'a> VisitMut<'a> for NullishCoalescingTransformer<'a> {
 
         if let Some(replacement) = self.convert_conditional_expression(expression) {
             *expression = replacement;
+            return;
+        }
+
+        if let Some(replacement) = self.convert_logical_expression(expression) {
+            *expression = replacement;
         }
     }
 
@@ -67,6 +72,34 @@ impl<'a> NullishCoalescingTransformer<'a> {
             target.clone_in(self.ast.allocator),
             LogicalOperator::Coalesce,
             conditional.alternate.clone_in(self.ast.allocator),
+        ))
+    }
+
+    fn convert_logical_expression(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<Expression<'a>> {
+        let Expression::LogicalExpression(logical) = expression else {
+            return None;
+        };
+        if logical.operator != LogicalOperator::And {
+            return None;
+        }
+
+        let guard = nullish_test_guard(&logical.left, &logical.right)?;
+        let target = match guard {
+            NullishGuard::Direct(target) => target,
+            NullishGuard::Temp { name, target } => {
+                self.unused_temps.insert(name.to_string());
+                target
+            }
+        };
+
+        Some(self.ast.expression_logical(
+            logical.span,
+            target.clone_in(self.ast.allocator),
+            LogicalOperator::Coalesce,
+            self.ast.expression_boolean_literal(logical.span, false),
         ))
     }
 
@@ -132,7 +165,14 @@ enum NullishGuard<'a, 'b> {
 fn nullish_guard<'a, 'b>(
     conditional: &'b ConditionalExpression<'a>,
 ) -> Option<NullishGuard<'a, 'b>> {
-    let Expression::LogicalExpression(logical) = without_parentheses(&conditional.test) else {
+    nullish_test_guard(&conditional.test, &conditional.consequent)
+}
+
+fn nullish_test_guard<'a, 'b>(
+    test: &'b Expression<'a>,
+    consequent: &'b Expression<'a>,
+) -> Option<NullishGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(test) else {
         return None;
     };
     if logical.operator != LogicalOperator::And {
@@ -145,13 +185,13 @@ fn nullish_guard<'a, 'b>(
     match (null_checked, undefined_checked) {
         (CheckedExpression::Direct(left_target), CheckedExpression::Direct(right_target))
             if expressions_equal(left_target, right_target)
-                && expressions_equal(left_target, &conditional.consequent) =>
+                && expressions_equal(left_target, consequent) =>
         {
             Some(NullishGuard::Direct(left_target))
         }
         (CheckedExpression::Temp { name, target }, CheckedExpression::Direct(right_target))
             if identifier_name(right_target) == Some(name)
-                && identifier_name(&conditional.consequent) == Some(name) =>
+                && identifier_name(consequent) == Some(name) =>
         {
             Some(NullishGuard::Temp { name, target })
         }
@@ -351,6 +391,31 @@ null !== (e = m.foo) && void 0 !== e ? e : void 0;
 ",
             "
 m.foo ?? void 0;
+",
+        );
+    }
+
+    #[test]
+    fn restores_logical_leaf_nullish_coalescing() {
+        define_ast_inline_test(transform_ast)(
+            "
+foo !== null && foo !== void 0 && foo;
+",
+            "
+foo ?? false;
+",
+        );
+    }
+
+    #[test]
+    fn restores_temp_assignment_logical_leaf_nullish_coalescing() {
+        define_ast_inline_test(transform_ast)(
+            "
+var e;
+null !== (e = l.foo.bar) && void 0 !== e && e;
+",
+            "
+l.foo.bar ?? false;
 ",
         );
     }

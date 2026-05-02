@@ -26,6 +26,11 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     let mut transformer = CommonJsImportTransformer::new(ast);
     transformer.transform_program(&mut source.program);
 
+    let mut dynamic_import_transformer = DynamicRequireTransformer {
+        ast: AstBuilder::new(source.allocator),
+    };
+    dynamic_import_transformer.visit_program(&mut source.program);
+
     let mut annotator = MissingRequireAnnotator {
         synthetic_trailing_comments: &mut source.synthetic_trailing_comments,
     };
@@ -177,6 +182,28 @@ impl<'a> CommonJsImportTransformer<'a> {
             }
             _ => false,
         }
+    }
+}
+
+struct DynamicRequireTransformer<'a> {
+    ast: AstBuilder<'a>,
+}
+
+impl<'a> VisitMut<'a> for DynamicRequireTransformer<'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+
+        let Some(source) = dynamic_require_source(expression) else {
+            return;
+        };
+
+        *expression = self.ast.expression_import(
+            Span::default(),
+            self.ast
+                .expression_string_literal(Span::default(), self.ast.str(&source), None),
+            None,
+            None,
+        );
     }
 }
 
@@ -425,6 +452,54 @@ fn require_call_source<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
     Some(source.value.as_str())
 }
 
+fn dynamic_require_source(expression: &Expression) -> Option<String> {
+    let Expression::CallExpression(call) = expression else {
+        return None;
+    };
+    if !is_then_call(call) || call.arguments.len() != 1 {
+        return None;
+    }
+
+    let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first() else {
+        return None;
+    };
+    if !arrow.expression
+        || !arrow.params.items.is_empty()
+        || arrow.params.rest.is_some()
+        || arrow.body.statements.len() != 1
+    {
+        return None;
+    }
+
+    let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first() else {
+        return None;
+    };
+
+    require_call_source(&statement.expression).map(str::to_string)
+}
+
+fn is_then_call(call: &CallExpression) -> bool {
+    let Expression::StaticMemberExpression(then_member) = &call.callee else {
+        return false;
+    };
+    if then_member.property.name != "then" {
+        return false;
+    }
+
+    let Expression::CallExpression(resolve_call) = &then_member.object else {
+        return false;
+    };
+    if !resolve_call.arguments.is_empty() {
+        return false;
+    }
+
+    let Expression::StaticMemberExpression(resolve_member) = &resolve_call.callee else {
+        return false;
+    };
+    resolve_member.property.name == "resolve"
+        && matches!(&resolve_member.object, Expression::Identifier(identifier) if identifier.name == "Promise")
+}
+
 fn is_require_callee(expression: &Expression) -> bool {
     matches!(expression, Expression::Identifier(identifier) if identifier.name == "require")
 }
@@ -562,6 +637,21 @@ _foo.default();
             "
 import _foo from \"foo\";
 _foo();
+",
+        );
+    }
+
+    #[test]
+    fn converts_promise_then_requires_to_dynamic_imports() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _interopRequireWildcard = require(\"@babel/runtime/helpers/interopRequireWildcard\");
+Promise.resolve().then(() => require('foo'));
+Promise.resolve().then(() => _interopRequireWildcard(require('bar')));
+",
+            "
+import(\"foo\");
+import(\"bar\");
 ",
         );
     }

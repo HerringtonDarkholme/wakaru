@@ -4,7 +4,8 @@ use oxc_allocator::{Box, CloneIn, TakeIn};
 use oxc_ast::{
     ast::{
         AssignmentExpression, AssignmentTarget, BindingPattern, ConditionalExpression, Expression,
-        FormalParameter, FormalParameters, Function, FunctionBody, IdentifierReference, Statement,
+        FormalParameter, FormalParameters, Function, FunctionBody, IdentifierReference,
+        LogicalExpression, Statement,
     },
     AstBuilder,
 };
@@ -142,6 +143,16 @@ impl<'a> DefaultParameterTransformer<'a> {
 
                 true
             }
+            ArgumentsParameterInit::DefaultBoolean { index, value } => {
+                let init = self.ast.expression_boolean_literal(Span::default(), value);
+                if let Some(parameter) = existing_param_mut(params, name) {
+                    parameter.initializer = Some(Box::new_in(init, self.ast.allocator));
+                } else {
+                    self.insert_parameter_at(params, index, name, Some(init), used_names);
+                }
+
+                true
+            }
         }
     }
 
@@ -198,6 +209,10 @@ enum ArgumentsParameterInit<'a, 'b> {
     Default {
         index: usize,
         default_value: &'b Expression<'a>,
+    },
+    DefaultBoolean {
+        index: usize,
+        value: bool,
     },
 }
 
@@ -275,18 +290,26 @@ fn arguments_parameter_declaration<'a>(
     let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
         return None;
     };
-    let Expression::ConditionalExpression(init) = declarator.init.as_ref()? else {
+    let init = declarator.init.as_ref()?;
+    let Expression::ConditionalExpression(conditional) = without_parentheses(init) else {
+        if let Some((index, value)) = logical_default_parameter_match(init) {
+            return Some((
+                identifier.name.as_str(),
+                ArgumentsParameterInit::DefaultBoolean { index, value },
+            ));
+        }
+
         return None;
     };
 
-    if let Some(index) = normal_parameter_index(init) {
+    if let Some(index) = normal_parameter_index(conditional) {
         return Some((
             identifier.name.as_str(),
             ArgumentsParameterInit::Normal { index },
         ));
     }
 
-    let (index, default_value) = default_parameter_match(init)?;
+    let (index, default_value) = default_parameter_match(conditional)?;
     Some((
         identifier.name.as_str(),
         ArgumentsParameterInit::Default {
@@ -332,6 +355,76 @@ fn default_parameter_match<'a, 'b>(
     Some((index, &conditional.alternate))
 }
 
+fn logical_default_parameter_match(expression: &Expression) -> Option<(usize, bool)> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+
+    match logical.operator {
+        LogicalOperator::And => truthy_logical_default_parameter_index(logical).map(|index| {
+            // `arguments.length > i && arguments[i] !== undefined && arguments[i]`
+            // is equivalent to an `arguments[i]` parameter with `false` as the fallback.
+            (index, false)
+        }),
+        LogicalOperator::Or => falsy_logical_default_parameter_index(logical).map(|index| {
+            // `!(arguments.length > i) || arguments[i] === undefined || arguments[i]`
+            // is equivalent to an `arguments[i]` parameter with `true` as the fallback.
+            (index, true)
+        }),
+        LogicalOperator::Coalesce => None,
+    }
+}
+
+fn truthy_logical_default_parameter_index(logical: &LogicalExpression) -> Option<usize> {
+    let index = arguments_present_and_not_undefined_index(&logical.left)?;
+    if arguments_member_index(&logical.right)? != index {
+        return None;
+    }
+
+    Some(index)
+}
+
+fn falsy_logical_default_parameter_index(logical: &LogicalExpression) -> Option<usize> {
+    let index = arguments_missing_or_undefined_index(&logical.left)?;
+    if arguments_member_index(&logical.right)? != index {
+        return None;
+    }
+
+    Some(index)
+}
+
+fn arguments_present_and_not_undefined_index(expression: &Expression) -> Option<usize> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::And {
+        return None;
+    }
+
+    let index = arguments_length_greater_than_index(&logical.left)?;
+    if arguments_member_not_undefined_index(&logical.right)? != index {
+        return None;
+    }
+
+    Some(index)
+}
+
+fn arguments_missing_or_undefined_index(expression: &Expression) -> Option<usize> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::Or {
+        return None;
+    }
+
+    let index = negated_arguments_length_greater_than_index(&logical.left)?;
+    if arguments_member_undefined_index(&logical.right)? != index {
+        return None;
+    }
+
+    Some(index)
+}
+
 fn arguments_length_greater_than_index(expression: &Expression) -> Option<usize> {
     let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
         return None;
@@ -343,11 +436,40 @@ fn arguments_length_greater_than_index(expression: &Expression) -> Option<usize>
     numeric_index(&binary.right)
 }
 
+fn negated_arguments_length_greater_than_index(expression: &Expression) -> Option<usize> {
+    let Expression::UnaryExpression(unary) = without_parentheses(expression) else {
+        return None;
+    };
+    if unary.operator != UnaryOperator::LogicalNot {
+        return None;
+    }
+
+    arguments_length_greater_than_index(&unary.argument)
+}
+
 fn arguments_member_not_undefined_index(expression: &Expression) -> Option<usize> {
     let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
         return None;
     };
     if binary.operator != BinaryOperator::StrictInequality {
+        return None;
+    }
+
+    if is_undefined_expression(&binary.right) {
+        return arguments_member_index(&binary.left);
+    }
+    if is_undefined_expression(&binary.left) {
+        return arguments_member_index(&binary.right);
+    }
+
+    None
+}
+
+fn arguments_member_undefined_index(expression: &Expression) -> Option<usize> {
+    let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
+        return None;
+    };
+    if binary.operator != BinaryOperator::StrictEquality {
         return None;
     }
 
@@ -544,6 +666,24 @@ function add2() {
             r#"
 function add2(a = 2, b) {
   return a + b;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn restores_logical_default_parameters() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+function test() {
+  var a = !(arguments.length > 0) || arguments[0] === undefined || arguments[0];
+  var b = arguments.length > 1 && arguments[1] !== undefined && arguments[1];
+  return a && b;
+}
+"#,
+            r#"
+function test(a = true, b = false) {
+  return a && b;
 }
 "#,
         );

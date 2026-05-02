@@ -1,12 +1,19 @@
-use oxc_allocator::Box;
+use oxc_allocator::{Box, TakeIn};
 use oxc_ast::{
-    ast::{Function, IdentifierReference},
+    ast::{
+        Argument, AssignmentExpression, AssignmentTarget, BindingPattern, Expression, ForStatement,
+        ForStatementInit, Function, IdentifierReference, SimpleAssignmentTarget, Statement,
+        VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    },
     AstBuilder,
 };
 use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::Span;
-use oxc_syntax::scope::ScopeFlags;
+use oxc_syntax::{
+    operator::{AssignmentOperator, BinaryOperator, UpdateOperator},
+    scope::ScopeFlags,
+};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::ParsedSourceFile;
 
@@ -40,7 +47,15 @@ impl<'a> VisitMut<'a> for ParameterRestTransformer<'a> {
 
 impl<'a> ParameterRestTransformer<'a> {
     fn try_transform_function(&self, function: &mut Function<'a>) {
-        if !function.params.items.is_empty() || function.params.rest.is_some() {
+        if function.params.rest.is_some() {
+            return;
+        }
+
+        if self.try_transform_generated_rest_loop(function) {
+            return;
+        }
+
+        if !function.params.items.is_empty() {
             return;
         }
 
@@ -74,19 +89,309 @@ impl<'a> ParameterRestTransformer<'a> {
         let mut renamer = ArgumentsRenamer { ast: self.ast };
         renamer.visit_function_body(body);
 
-        function.params.rest =
-            Some(self.ast.alloc_formal_parameter_rest(
+        function.params.rest = Some(self.rest_parameter("args"));
+    }
+
+    fn try_transform_generated_rest_loop(&self, function: &mut Function<'a>) -> bool {
+        let Some(body) = function.body.as_mut() else {
+            return false;
+        };
+        let Some((statement_index, rest_loop)) =
+            body.statements
+                .iter()
+                .enumerate()
+                .find_map(|(index, statement)| {
+                    generated_rest_loop(statement).map(|rest| (index, rest))
+                })
+        else {
+            return false;
+        };
+
+        if function.params.items.len() != rest_loop.start_index
+            || function.params.items.iter().any(|parameter| {
+                parameter_identifier_name(parameter) == Some(rest_loop.name.as_str())
+            })
+        {
+            return false;
+        }
+
+        let old_statements = body.statements.take_in(self.ast);
+        let mut new_statements = self
+            .ast
+            .vec_with_capacity(old_statements.len().saturating_sub(1));
+        for (index, statement) in old_statements.into_iter().enumerate() {
+            if index != statement_index {
+                new_statements.push(statement);
+            }
+        }
+        body.statements = new_statements;
+
+        function.params.rest = Some(self.rest_parameter(rest_loop.name.as_str()));
+
+        true
+    }
+
+    fn rest_parameter(&self, name: &str) -> Box<'a, oxc_ast::ast::FormalParameterRest<'a>> {
+        self.ast.alloc_formal_parameter_rest(
+            Span::default(),
+            self.ast.vec(),
+            self.ast.binding_rest_element(
                 Span::default(),
-                self.ast.vec(),
-                self.ast.binding_rest_element(
-                    Span::default(),
-                    self.ast.binding_pattern_binding_identifier(
-                        Span::default(),
-                        self.ast.ident("args"),
-                    ),
-                ),
-                None::<Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
-            ));
+                self.ast
+                    .binding_pattern_binding_identifier(Span::default(), self.ast.ident(name)),
+            ),
+            None::<Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
+        )
+    }
+}
+
+struct GeneratedRestLoop {
+    name: String,
+    start_index: usize,
+}
+
+fn generated_rest_loop(statement: &Statement) -> Option<GeneratedRestLoop> {
+    let Statement::ForStatement(for_statement) = statement else {
+        return None;
+    };
+    let declaration = for_var_declaration(for_statement)?;
+    if declaration.declarations.len() != 3 {
+        return None;
+    }
+
+    let len_declarator = &declaration.declarations[0];
+    let rest_declarator = &declaration.declarations[1];
+    let key_declarator = &declaration.declarations[2];
+
+    let len_name = binding_identifier_name(len_declarator)?;
+    if !len_declarator
+        .init
+        .as_ref()
+        .is_some_and(is_arguments_length)
+    {
+        return None;
+    }
+
+    let rest_name = binding_identifier_name(rest_declarator)?;
+    let key_name = binding_identifier_name(key_declarator)?;
+    let start_index = numeric_index(key_declarator.init.as_ref()?)?;
+
+    if !is_rest_array_init(rest_declarator.init.as_ref()?, len_name, start_index)
+        || !is_key_less_than_len(for_statement.test.as_ref()?, key_name, len_name)
+        || !is_key_increment(for_statement.update.as_ref()?, key_name)
+        || !is_rest_copy_body(&for_statement.body, rest_name, key_name, start_index)
+    {
+        return None;
+    }
+
+    Some(GeneratedRestLoop {
+        name: rest_name.to_string(),
+        start_index,
+    })
+}
+
+fn for_var_declaration<'a, 'b>(
+    for_statement: &'b ForStatement<'a>,
+) -> Option<&'b VariableDeclaration<'a>> {
+    let Some(ForStatementInit::VariableDeclaration(declaration)) = &for_statement.init else {
+        return None;
+    };
+    if declaration.kind != VariableDeclarationKind::Var {
+        return None;
+    }
+
+    Some(declaration)
+}
+
+fn is_rest_array_init(expression: &Expression, len_name: &str, start_index: usize) -> bool {
+    let Expression::NewExpression(new_expression) = without_parentheses(expression) else {
+        return false;
+    };
+    if !is_identifier(&new_expression.callee, "Array") || new_expression.arguments.len() != 1 {
+        return false;
+    }
+
+    match &new_expression.arguments[0] {
+        Argument::Identifier(identifier) => {
+            start_index == 0 && identifier.name.as_str() == len_name
+        }
+        Argument::ConditionalExpression(conditional) => {
+            if start_index == 0 {
+                return false;
+            }
+            is_len_greater_than_start(&conditional.test, len_name, start_index)
+                && is_len_minus_start(&conditional.consequent, len_name, start_index)
+                && numeric_index(&conditional.alternate) == Some(0)
+        }
+        _ => false,
+    }
+}
+
+fn is_key_less_than_len(expression: &Expression, key_name: &str, len_name: &str) -> bool {
+    let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
+        return false;
+    };
+
+    binary.operator == BinaryOperator::LessThan
+        && is_identifier(&binary.left, key_name)
+        && is_identifier(&binary.right, len_name)
+}
+
+fn is_key_increment(expression: &Expression, key_name: &str) -> bool {
+    let Expression::UpdateExpression(update) = without_parentheses(expression) else {
+        return false;
+    };
+    if update.operator != UpdateOperator::Increment {
+        return false;
+    }
+
+    matches!(
+        &update.argument,
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier)
+            if identifier.name.as_str() == key_name
+    )
+}
+
+fn is_rest_copy_body(
+    statement: &Statement,
+    rest_name: &str,
+    key_name: &str,
+    start_index: usize,
+) -> bool {
+    let Statement::BlockStatement(block) = statement else {
+        return false;
+    };
+    if block.body.len() != 1 {
+        return false;
+    }
+
+    let Some(assignment) = assignment_expression_statement(&block.body[0]) else {
+        return false;
+    };
+    if assignment.operator != AssignmentOperator::Assign {
+        return false;
+    }
+
+    is_rest_assignment_target(&assignment.left, rest_name, key_name, start_index)
+        && is_arguments_key_member(&assignment.right, key_name)
+}
+
+fn assignment_expression_statement<'a, 'b>(
+    statement: &'b Statement<'a>,
+) -> Option<&'b AssignmentExpression<'a>> {
+    let Statement::ExpressionStatement(statement) = statement else {
+        return None;
+    };
+    let Expression::AssignmentExpression(assignment) = &statement.expression else {
+        return None;
+    };
+
+    Some(assignment)
+}
+
+fn is_rest_assignment_target(
+    target: &AssignmentTarget,
+    rest_name: &str,
+    key_name: &str,
+    start_index: usize,
+) -> bool {
+    let AssignmentTarget::ComputedMemberExpression(member) = target else {
+        return false;
+    };
+
+    is_identifier(&member.object, rest_name)
+        && is_rest_target_index(&member.expression, key_name, start_index)
+}
+
+fn is_rest_target_index(expression: &Expression, key_name: &str, start_index: usize) -> bool {
+    if start_index == 0 {
+        return is_identifier(expression, key_name);
+    }
+
+    is_key_minus_start(expression, key_name, start_index)
+}
+
+fn is_arguments_key_member(expression: &Expression, key_name: &str) -> bool {
+    let Expression::ComputedMemberExpression(member) = without_parentheses(expression) else {
+        return false;
+    };
+
+    is_identifier(&member.object, "arguments") && is_identifier(&member.expression, key_name)
+}
+
+fn is_len_greater_than_start(expression: &Expression, len_name: &str, start_index: usize) -> bool {
+    let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
+        return false;
+    };
+
+    binary.operator == BinaryOperator::GreaterThan
+        && is_identifier(&binary.left, len_name)
+        && numeric_index(&binary.right) == Some(start_index)
+}
+
+fn is_len_minus_start(expression: &Expression, len_name: &str, start_index: usize) -> bool {
+    is_identifier_minus_number(expression, len_name, start_index)
+}
+
+fn is_key_minus_start(expression: &Expression, key_name: &str, start_index: usize) -> bool {
+    is_identifier_minus_number(expression, key_name, start_index)
+}
+
+fn is_identifier_minus_number(expression: &Expression, name: &str, number: usize) -> bool {
+    let Expression::BinaryExpression(binary) = without_parentheses(expression) else {
+        return false;
+    };
+
+    binary.operator == BinaryOperator::Subtraction
+        && is_identifier(&binary.left, name)
+        && numeric_index(&binary.right) == Some(number)
+}
+
+fn is_arguments_length(expression: &Expression) -> bool {
+    let Expression::StaticMemberExpression(member) = without_parentheses(expression) else {
+        return false;
+    };
+
+    is_identifier(&member.object, "arguments") && member.property.name.as_str() == "length"
+}
+
+fn numeric_index(expression: &Expression) -> Option<usize> {
+    let Expression::NumericLiteral(number) = without_parentheses(expression) else {
+        return None;
+    };
+    if number.value < 0.0 || number.value.fract() != 0.0 {
+        return None;
+    }
+
+    Some(number.value as usize)
+}
+
+fn is_identifier(expression: &Expression, name: &str) -> bool {
+    matches!(without_parentheses(expression), Expression::Identifier(identifier) if identifier.name.as_str() == name)
+}
+
+fn binding_identifier_name<'a>(declarator: &'a VariableDeclarator<'a>) -> Option<&'a str> {
+    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+        return None;
+    };
+
+    Some(identifier.name.as_str())
+}
+
+fn parameter_identifier_name<'a>(parameter: &'a oxc_ast::ast::FormalParameter) -> Option<&'a str> {
+    let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+        return None;
+    };
+
+    Some(identifier.name.as_str())
+}
+
+fn without_parentheses<'a, 'b>(expression: &'b Expression<'a>) -> &'b Expression<'a> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            without_parentheses(&parenthesized.expression)
+        }
+        _ => expression,
     }
 }
 
@@ -172,6 +477,46 @@ var foo = function() {
 var foo = function(...args) {
   var bar = () => console.log(args);
 };
+",
+        );
+    }
+
+    #[test]
+    fn restores_generated_rest_loop_without_formal_params() {
+        define_ast_inline_test(transform_ast)(
+            "
+function foo() {
+  for (var _len = arguments.length, args = new Array(_len), _key = 0; _key < _len; _key++) {
+    args[_key] = arguments[_key];
+  }
+  args.pop();
+  foo.apply(void 0, args);
+}
+",
+            "
+function foo(...args) {
+  args.pop();
+  foo.apply(void 0, args);
+}
+",
+        );
+    }
+
+    #[test]
+    fn restores_generated_rest_loop_after_formal_param() {
+        define_ast_inline_test(transform_ast)(
+            "
+function foo(first) {
+  for (var _len = arguments.length, args = new Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+    args[_key - 1] = arguments[_key];
+  }
+  return args.length + first;
+}
+",
+            "
+function foo(first, ...args) {
+  return args.length + first;
+}
 ",
         );
     }

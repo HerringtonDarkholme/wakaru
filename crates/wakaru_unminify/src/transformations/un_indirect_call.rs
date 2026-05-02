@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::TakeIn;
 use oxc_ast::{
     ast::{
-        CallExpression, Expression, ImportDeclaration, ImportDeclarationSpecifier,
-        ImportOrExportKind,
+        Argument, BindingPattern, BindingProperty, CallExpression, Expression, ImportDeclaration,
+        ImportDeclarationSpecifier, ImportOrExportKind, PropertyKey, Statement,
+        VariableDeclaration, VariableDeclarationKind,
     },
     AstBuilder,
 };
@@ -47,6 +48,12 @@ struct ImportState {
     occupied_names: HashSet<String>,
     replaced_default_refs: HashMap<SymbolId, usize>,
     replacement_cache: HashMap<(SymbolId, String), String>,
+    require_bindings: HashMap<SymbolId, RequireBinding>,
+    require_binding_order: Vec<SymbolId>,
+    require_destructures: Vec<RequireDestructure>,
+    require_destructure_additions: HashMap<(usize, usize), Vec<RequirePropertyAddition>>,
+    require_insertions: HashMap<SymbolId, RequireDestructureInsertion>,
+    require_replacement_cache: HashMap<(SymbolId, String), String>,
 }
 
 struct DefaultImport {
@@ -56,6 +63,31 @@ struct DefaultImport {
 struct NamedImportAddition {
     imported: String,
     local: String,
+}
+
+struct RequireBinding {
+    local: String,
+    statement_index: usize,
+    span: Span,
+}
+
+struct RequireDestructure {
+    symbol_id: SymbolId,
+    statement_index: usize,
+    declarator_index: usize,
+    span: Span,
+    properties: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct RequirePropertyAddition {
+    imported: String,
+    local: String,
+}
+
+struct RequireDestructureInsertion {
+    object_local: String,
+    properties: Vec<RequirePropertyAddition>,
 }
 
 impl ImportState {
@@ -71,6 +103,22 @@ impl ImportState {
             };
 
             state.collect_import(import);
+        }
+
+        for (statement_index, statement) in program.body.iter().enumerate() {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                continue;
+            };
+
+            state.collect_require_bindings(statement_index, declaration);
+        }
+
+        for (statement_index, statement) in program.body.iter().enumerate() {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                continue;
+            };
+
+            state.collect_require_destructures(statement_index, declaration, scoping);
         }
 
         state
@@ -189,6 +237,166 @@ impl ImportState {
             .unwrap_or(0);
         replaced > 0 && replaced == scoping.get_resolved_reference_ids(symbol_id).len()
     }
+
+    fn collect_require_bindings(
+        &mut self,
+        statement_index: usize,
+        declaration: &VariableDeclaration,
+    ) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            if !is_require_call(init) {
+                continue;
+            }
+            let Some(symbol_id) = identifier.symbol_id.get() else {
+                continue;
+            };
+
+            self.require_bindings.insert(
+                symbol_id,
+                RequireBinding {
+                    local: identifier.name.as_str().to_string(),
+                    statement_index,
+                    span: declaration.span,
+                },
+            );
+            self.require_binding_order.push(symbol_id);
+        }
+    }
+
+    fn collect_require_destructures(
+        &mut self,
+        statement_index: usize,
+        declaration: &VariableDeclaration,
+        scoping: &Scoping,
+    ) {
+        for (declarator_index, declarator) in declaration.declarations.iter().enumerate() {
+            let BindingPattern::ObjectPattern(pattern) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::Identifier(init)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol_id) = init
+                .reference_id
+                .get()
+                .and_then(|reference_id| scoping.get_reference(reference_id).symbol_id())
+            else {
+                continue;
+            };
+            if !self.require_bindings.contains_key(&symbol_id) {
+                continue;
+            }
+
+            let mut properties = HashMap::new();
+            for property in &pattern.properties {
+                let Some((imported, local)) = binding_property_names(property) else {
+                    continue;
+                };
+                properties.insert(imported.to_string(), local.to_string());
+            }
+
+            self.require_destructures.push(RequireDestructure {
+                symbol_id,
+                statement_index,
+                declarator_index,
+                span: declaration.span,
+                properties,
+            });
+        }
+    }
+
+    fn local_for_required_property(
+        &mut self,
+        symbol_id: SymbolId,
+        imported: &str,
+        call_span: Span,
+    ) -> Option<String> {
+        let cache_key = (symbol_id, imported.to_string());
+        if let Some(local) = self.require_replacement_cache.get(&cache_key) {
+            return Some(local.clone());
+        }
+
+        if let Some(local) = self.existing_required_property_local(symbol_id, imported, call_span) {
+            self.require_replacement_cache
+                .insert(cache_key, local.clone());
+            return Some(local);
+        }
+
+        let local = self.generate_name(imported);
+        let addition = RequirePropertyAddition {
+            imported: imported.to_string(),
+            local: local.clone(),
+        };
+
+        if let Some((statement_index, declarator_index)) =
+            self.existing_required_destructure_destination(symbol_id, call_span)
+        {
+            self.require_destructure_additions
+                .entry((statement_index, declarator_index))
+                .or_default()
+                .push(addition);
+        } else {
+            let require_binding = self.require_bindings.get(&symbol_id)?;
+            self.require_insertions
+                .entry(symbol_id)
+                .or_insert_with(|| RequireDestructureInsertion {
+                    object_local: require_binding.local.clone(),
+                    properties: Vec::new(),
+                })
+                .properties
+                .push(addition);
+        }
+
+        self.require_replacement_cache
+            .insert(cache_key, local.clone());
+        Some(local)
+    }
+
+    fn existing_required_property_local(
+        &self,
+        symbol_id: SymbolId,
+        imported: &str,
+        call_span: Span,
+    ) -> Option<String> {
+        self.require_destructures
+            .iter()
+            .filter(|destructure| {
+                destructure.symbol_id == symbol_id
+                    && self.is_between_require_and_call(destructure.span, symbol_id, call_span)
+            })
+            .find_map(|destructure| destructure.properties.get(imported).cloned())
+    }
+
+    fn existing_required_destructure_destination(
+        &self,
+        symbol_id: SymbolId,
+        call_span: Span,
+    ) -> Option<(usize, usize)> {
+        self.require_destructures
+            .iter()
+            .find(|destructure| {
+                destructure.symbol_id == symbol_id
+                    && self.is_between_require_and_call(destructure.span, symbol_id, call_span)
+            })
+            .map(|destructure| (destructure.statement_index, destructure.declarator_index))
+    }
+
+    fn is_between_require_and_call(
+        &self,
+        span: Span,
+        symbol_id: SymbolId,
+        call_span: Span,
+    ) -> bool {
+        self.require_bindings
+            .get(&symbol_id)
+            .is_some_and(|binding| span.start > binding.span.end && span.end < call_span.start)
+    }
 }
 
 struct IndirectCallReplacer<'a, 's, 'i> {
@@ -201,29 +409,58 @@ impl<'a> VisitMut<'a> for IndirectCallReplacer<'a, '_, '_> {
     fn visit_call_expression(&mut self, call: &mut CallExpression<'a>) {
         walk_mut::walk_call_expression(self, call);
 
-        let Some(target) = indirect_import_call_target(&call.callee, self.scoping, self.imports)
+        let Some(target) =
+            indirect_import_call_target(&call.callee, call.span, self.scoping, self.imports)
         else {
             return;
         };
 
-        let local =
-            self.imports
-                .local_for_named_import(target.symbol_id, &target.source, &target.imported);
-        self.imports.record_replaced_default_ref(target.symbol_id);
+        let local = match target {
+            IndirectCallTarget::Import {
+                symbol_id,
+                source,
+                imported,
+            } => {
+                let local = self
+                    .imports
+                    .local_for_named_import(symbol_id, &source, &imported);
+                self.imports.record_replaced_default_ref(symbol_id);
+                local
+            }
+            IndirectCallTarget::Require {
+                symbol_id,
+                imported,
+            } => {
+                let Some(local) = self
+                    .imports
+                    .local_for_required_property(symbol_id, &imported, call.span)
+                else {
+                    return;
+                };
+                local
+            }
+        };
         call.callee = self
             .ast
             .expression_identifier(Span::default(), self.ast.ident(&local));
     }
 }
 
-struct IndirectCallTarget {
-    symbol_id: SymbolId,
-    source: String,
-    imported: String,
+enum IndirectCallTarget {
+    Import {
+        symbol_id: SymbolId,
+        source: String,
+        imported: String,
+    },
+    Require {
+        symbol_id: SymbolId,
+        imported: String,
+    },
 }
 
 fn indirect_import_call_target(
     callee: &Expression,
+    call_span: Span,
     scoping: &Scoping,
     imports: &ImportState,
 ) -> Option<IndirectCallTarget> {
@@ -245,13 +482,27 @@ fn indirect_import_call_target(
         .reference_id
         .get()
         .and_then(|reference_id| scoping.get_reference(reference_id).symbol_id())?;
-    let default_import = imports.default_imports.get(&symbol_id)?;
 
-    Some(IndirectCallTarget {
-        symbol_id,
-        source: default_import.source.clone(),
-        imported: member.property.name.as_str().to_string(),
-    })
+    if let Some(default_import) = imports.default_imports.get(&symbol_id) {
+        return Some(IndirectCallTarget::Import {
+            symbol_id,
+            source: default_import.source.clone(),
+            imported: member.property.name.as_str().to_string(),
+        });
+    }
+
+    if imports
+        .require_bindings
+        .get(&symbol_id)
+        .is_some_and(|binding| call_span.start > binding.span.end)
+    {
+        return Some(IndirectCallTarget::Require {
+            symbol_id,
+            imported: member.property.name.as_str().to_string(),
+        });
+    }
+
+    None
 }
 
 fn is_zero_literal(expression: &Expression) -> bool {
@@ -278,14 +529,24 @@ impl<'a> ImportRewriter<'a, '_> {
         let old_body = program.body.take_in(self.ast);
         let mut new_body = self.ast.vec_with_capacity(old_body.len());
 
-        for statement in old_body {
+        for (statement_index, statement) in old_body.into_iter().enumerate() {
+            let mut keep_statement = true;
             match statement {
                 oxc_ast::ast::Statement::ImportDeclaration(mut import) => {
                     if self.rewrite_import_declaration(&mut import) {
                         new_body.push(oxc_ast::ast::Statement::ImportDeclaration(import));
                     }
+                    keep_statement = false;
+                }
+                oxc_ast::ast::Statement::VariableDeclaration(mut declaration) => {
+                    self.rewrite_require_destructuring(statement_index, &mut declaration);
+                    new_body.push(oxc_ast::ast::Statement::VariableDeclaration(declaration));
                 }
                 statement => new_body.push(statement),
+            }
+
+            if keep_statement {
+                self.push_require_insertions(statement_index, &mut new_body);
             }
         }
 
@@ -330,6 +591,57 @@ impl<'a> ImportRewriter<'a, '_> {
 
         !specifiers.is_empty()
     }
+
+    fn rewrite_require_destructuring(
+        &mut self,
+        statement_index: usize,
+        declaration: &mut VariableDeclaration<'a>,
+    ) {
+        for (declarator_index, declarator) in declaration.declarations.iter_mut().enumerate() {
+            let Some(additions) = self
+                .imports
+                .require_destructure_additions
+                .remove(&(statement_index, declarator_index))
+            else {
+                continue;
+            };
+            let BindingPattern::ObjectPattern(pattern) = &mut declarator.id else {
+                continue;
+            };
+
+            for addition in additions {
+                pattern.properties.push(require_binding_property(
+                    self.ast,
+                    &addition.imported,
+                    &addition.local,
+                ));
+            }
+        }
+    }
+
+    fn push_require_insertions(
+        &mut self,
+        statement_index: usize,
+        new_body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+    ) {
+        for symbol_id in self.imports.require_binding_order.clone() {
+            let Some(binding) = self.imports.require_bindings.get(&symbol_id) else {
+                continue;
+            };
+            if binding.statement_index != statement_index {
+                continue;
+            }
+            let Some(insertion) = self.imports.require_insertions.remove(&symbol_id) else {
+                continue;
+            };
+
+            new_body.push(require_destructure_statement(
+                self.ast,
+                &insertion.object_local,
+                insertion.properties,
+            ));
+        }
+    }
 }
 
 fn named_import_specifier<'a>(
@@ -363,6 +675,84 @@ fn imported_name<'a>(imported: &'a oxc_ast::ast::ModuleExportName<'a>) -> Option
         }
         oxc_ast::ast::ModuleExportName::StringLiteral(_) => None,
     }
+}
+
+fn is_require_call(expression: &Expression) -> bool {
+    let Expression::CallExpression(call) = without_parentheses(expression) else {
+        return false;
+    };
+    if call.arguments.len() != 1 {
+        return false;
+    }
+    if !matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "require") {
+        return false;
+    }
+
+    matches!(
+        call.arguments.first(),
+        Some(Argument::StringLiteral(_) | Argument::NumericLiteral(_))
+    )
+}
+
+fn binding_property_names<'a>(property: &'a BindingProperty<'a>) -> Option<(&'a str, &'a str)> {
+    let PropertyKey::StaticIdentifier(key) = &property.key else {
+        return None;
+    };
+    let BindingPattern::BindingIdentifier(value) = &property.value else {
+        return None;
+    };
+
+    Some((key.name.as_str(), value.name.as_str()))
+}
+
+fn require_destructure_statement<'a>(
+    ast: AstBuilder<'a>,
+    object_local: &str,
+    additions: Vec<RequirePropertyAddition>,
+) -> Statement<'a> {
+    let mut properties = ast.vec_with_capacity(additions.len());
+    for addition in additions {
+        properties.push(require_binding_property(
+            ast,
+            &addition.imported,
+            &addition.local,
+        ));
+    }
+
+    let mut declarations = ast.vec_with_capacity(1);
+    declarations.push(ast.variable_declarator(
+        Span::default(),
+        VariableDeclarationKind::Const,
+        ast.binding_pattern_object_pattern(
+            Span::default(),
+            properties,
+            None::<oxc_allocator::Box<'a, oxc_ast::ast::BindingRestElement<'a>>>,
+        ),
+        None::<oxc_allocator::Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
+        Some(ast.expression_identifier(Span::default(), ast.ident(object_local))),
+        false,
+    ));
+
+    Statement::VariableDeclaration(ast.alloc_variable_declaration(
+        Span::default(),
+        VariableDeclarationKind::Const,
+        declarations,
+        false,
+    ))
+}
+
+fn require_binding_property<'a>(
+    ast: AstBuilder<'a>,
+    imported: &str,
+    local: &str,
+) -> BindingProperty<'a> {
+    ast.binding_property(
+        Span::default(),
+        ast.property_key_static_identifier(Span::default(), ast.ident(imported)),
+        ast.binding_pattern_binding_identifier(Span::default(), ast.ident(local)),
+        imported == local,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -454,6 +844,104 @@ import s from \"react\";
 function fn(s) {
   return (0, s.useRef)(0);
 }
+",
+        );
+    }
+
+    #[test]
+    fn inserts_destructuring_for_required_modules() {
+        define_ast_inline_test(transform_ast)(
+            "
+const s = require(\"react\");
+
+var countRef = (0, s.useRef)(0);
+",
+            "
+const s = require(\"react\");
+const { useRef } = s;
+var countRef = useRef(0);
+",
+        );
+    }
+
+    #[test]
+    fn extends_existing_required_module_destructuring() {
+        define_ast_inline_test(transform_ast)(
+            "
+const s = require(\"react\");
+const { useRef } = s;
+
+var countRef = (0, s.useRef)(0);
+var secondRef = (0, s.useMemo)(() => {}, []);
+",
+            "
+const s = require(\"react\");
+const { useRef, useMemo } = s;
+var countRef = useRef(0);
+var secondRef = useMemo(() => {}, []);
+",
+        );
+    }
+
+    #[test]
+    fn ignores_required_module_destructuring_declared_after_call() {
+        define_ast_inline_test(transform_ast)(
+            "
+const s = require(\"react\");
+
+var countRef = (0, s.useRef)(0);
+
+const { useRef } = s;
+",
+            "
+const s = require(\"react\");
+const { useRef: useRef_1 } = s;
+var countRef = useRef_1(0);
+const { useRef } = s;
+",
+        );
+    }
+
+    #[test]
+    fn coordinates_names_between_required_and_imported_modules() {
+        define_ast_inline_test(transform_ast)(
+            "
+import p from \"r2\";
+
+const s = require(\"react\");
+
+var countRef = (0, s.useRef)(0);
+var secondRef = (0, p.useRef)(0);
+",
+            "
+import { useRef as useRef_1 } from \"r2\";
+const s = require(\"react\");
+const { useRef } = s;
+var countRef = useRef(0);
+var secondRef = useRef_1(0);
+",
+        );
+    }
+
+    #[test]
+    fn inserts_destructuring_for_multiple_required_modules() {
+        define_ast_inline_test(transform_ast)(
+            "
+const s = require(\"react\");
+const t = require(9527);
+
+var countRef = (0, s.useRef)(0);
+var secondRef = (0, t.useRef)(0);
+var thirdRef = (0, t.useRef)(0);
+",
+            "
+const s = require(\"react\");
+const { useRef } = s;
+const t = require(9527);
+const { useRef: useRef_1 } = t;
+var countRef = useRef(0);
+var secondRef = useRef_1(0);
+var thirdRef = useRef_1(0);
 ",
         );
     }

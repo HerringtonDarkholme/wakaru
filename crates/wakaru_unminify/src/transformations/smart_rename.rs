@@ -1,13 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::{
-    ast::{BindingIdentifier, BindingPattern, BindingProperty, IdentifierReference, PropertyKey},
+    ast::{
+        BindingIdentifier, BindingPattern, BindingProperty, CallExpression, Expression,
+        IdentifierReference, PropertyKey, VariableDeclarator,
+    },
     AstBuilder,
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_semantic::{ScopeId, Scoping, SemanticBuilder, SymbolId};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::ParsedSourceFile;
+
+const MINIFIED_IDENTIFIER_THRESHOLD: usize = 2;
 
 pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     let scoping = SemanticBuilder::new()
@@ -41,6 +46,11 @@ struct DestructuringRenameCollector<'a, 's> {
 }
 
 impl<'a> VisitMut<'a> for DestructuringRenameCollector<'a, '_> {
+    fn visit_variable_declarator(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        self.rename_use_state_setter(declarator);
+        walk_mut::walk_variable_declarator(self, declarator);
+    }
+
     fn visit_binding_property(&mut self, property: &mut BindingProperty<'a>) {
         self.rename_property(property);
         walk_mut::walk_binding_property(self, property);
@@ -86,6 +96,53 @@ impl<'a> DestructuringRenameCollector<'a, '_> {
         property.shorthand = new_name == key_name;
     }
 
+    fn rename_use_state_setter(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        let Some(Expression::CallExpression(call)) = declarator.init.as_ref() else {
+            return;
+        };
+        if !is_react_call(call, "useState") || call.arguments.len() > 1 {
+            return;
+        }
+
+        let BindingPattern::ArrayPattern(pattern) = &mut declarator.id else {
+            return;
+        };
+        if pattern.elements.is_empty() || pattern.elements.len() > 2 {
+            return;
+        }
+
+        if !is_optional_binding_identifier_or_hole(pattern.elements.first()) {
+            return;
+        }
+
+        let state_name =
+            optional_binding_identifier_name(pattern.elements.first()).map(str::to_string);
+        let Some(setter) = optional_binding_identifier_mut(pattern.elements.get_mut(1)) else {
+            return;
+        };
+
+        let setter_name = setter.name.as_str().to_string();
+        let base_name = state_name.as_deref().unwrap_or(setter_name.as_str());
+        if base_name.len() > MINIFIED_IDENTIFIER_THRESHOLD {
+            return;
+        }
+
+        let Some(symbol_id) = setter.symbol_id.get() else {
+            return;
+        };
+
+        let scope_id = self.scoping.symbol_scope_id(symbol_id);
+        let new_name =
+            self.generate_target_name(scope_id, &format!("set{}", pascal_case(base_name)));
+
+        self.generated_names
+            .entry(scope_id)
+            .or_default()
+            .insert(new_name.clone());
+        self.renames.insert(symbol_id, new_name.clone());
+        setter.name = self.ast.ident(&new_name);
+    }
+
     fn generate_target_name(&self, scope_id: ScopeId, key_name: &str) -> String {
         let base = if is_valid_binding_identifier(key_name) {
             key_name.to_string()
@@ -127,6 +184,55 @@ impl<'a> DestructuringRenameCollector<'a, '_> {
             scope_id = parent_scope_id;
         }
     }
+}
+
+fn is_react_call(call: &CallExpression, hook_name: &str) -> bool {
+    is_callee_name(&call.callee, hook_name)
+}
+
+fn is_callee_name(expression: &Expression, name: &str) -> bool {
+    match expression {
+        Expression::Identifier(identifier) => identifier.name.as_str() == name,
+        Expression::StaticMemberExpression(member) => member.property.name.as_str() == name,
+        Expression::ParenthesizedExpression(parenthesized) => {
+            is_callee_name(&parenthesized.expression, name)
+        }
+        _ => false,
+    }
+}
+
+fn optional_binding_identifier_name<'a, 'b>(
+    element: Option<&'b Option<BindingPattern<'a>>>,
+) -> Option<&'b str> {
+    let Some(Some(BindingPattern::BindingIdentifier(identifier))) = element else {
+        return None;
+    };
+    Some(identifier.name.as_str())
+}
+
+fn is_optional_binding_identifier_or_hole(element: Option<&Option<BindingPattern>>) -> bool {
+    matches!(
+        element,
+        None | Some(None) | Some(Some(BindingPattern::BindingIdentifier(_)))
+    )
+}
+
+fn optional_binding_identifier_mut<'a, 'b>(
+    element: Option<&'b mut Option<BindingPattern<'a>>>,
+) -> Option<&'b mut BindingIdentifier<'a>> {
+    let Some(Some(BindingPattern::BindingIdentifier(identifier))) = element else {
+        return None;
+    };
+    Some(identifier)
+}
+
+fn pascal_case(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    first.to_ascii_uppercase().to_string() + chars.as_str()
 }
 
 struct SymbolRenamer<'a, 's> {
@@ -337,6 +443,27 @@ o.delete(t);
             "
 const { static: _static, default: _default } = n;
 _default.delete(_static);
+",
+        );
+    }
+
+    #[test]
+    fn react_renames_use_state_setters() {
+        define_ast_inline_test(transform_ast)(
+            "
+const [e, f] = useState();
+const [, g] = o.useState(0);
+const [value, h] = useState(1);
+const [{ value: i }, j] = useState();
+
+const k = o.useState(a, b);
+",
+            "
+const [e, setE] = useState();
+const [, setG] = o.useState(0);
+const [value, h] = useState(1);
+const [{ value: value_1 }, j] = useState();
+const k = o.useState(a, b);
 ",
         );
     }
