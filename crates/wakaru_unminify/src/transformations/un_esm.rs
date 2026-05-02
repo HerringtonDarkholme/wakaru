@@ -387,6 +387,7 @@ impl<'a> CommonJsExportTransformer<'a> {
 struct CommonJsImportTransformer<'a> {
     ast: AstBuilder<'a>,
     imports: ImportManager,
+    declared_names: HashSet<String>,
     namespace_hints: NamespaceImportHints,
     namespace_aliases: HashMap<String, NamespaceAlias>,
 }
@@ -396,12 +397,14 @@ impl<'a> CommonJsImportTransformer<'a> {
         Self {
             ast,
             imports: ImportManager::default(),
+            declared_names: HashSet::new(),
             namespace_hints,
             namespace_aliases: HashMap::new(),
         }
     }
 
     fn transform_program(&mut self, program: &mut Program<'a>) {
+        self.declared_names = collect_top_level_declared_names(&program.body);
         self.namespace_aliases = self.collect_namespace_aliases(&program.body);
         let rename_map = self.namespace_rename_map();
 
@@ -419,8 +422,14 @@ impl<'a> CommonJsImportTransformer<'a> {
                     if self.collect_bare_require(&statement.expression) => {}
                 Statement::VariableDeclaration(declaration)
                     if self.collect_namespace_declaration(&declaration) => {}
-                Statement::VariableDeclaration(declaration)
-                    if self.collect_variable_require(&declaration) => {}
+                Statement::VariableDeclaration(declaration) => {
+                    match self.collect_variable_require(declaration) {
+                        Ok(replacements) => kept_body.extend(replacements),
+                        Err(declaration) => {
+                            kept_body.push(Statement::VariableDeclaration(declaration))
+                        }
+                    }
+                }
                 statement => kept_body.push(statement),
             }
         }
@@ -597,17 +606,36 @@ impl<'a> CommonJsImportTransformer<'a> {
         true
     }
 
-    fn collect_variable_require(&mut self, declaration: &VariableDeclaration<'a>) -> bool {
+    fn collect_variable_require(
+        &mut self,
+        mut declaration: oxc_allocator::Box<'a, VariableDeclaration<'a>>,
+    ) -> std::result::Result<
+        oxc_allocator::Vec<'a, Statement<'a>>,
+        oxc_allocator::Box<'a, VariableDeclaration<'a>>,
+    > {
         if declaration.declarations.len() != 1 {
-            return false;
+            return Err(declaration);
         }
 
-        let declarator = &declaration.declarations[0];
-        if self.collect_basic_require(declarator) {
-            return true;
+        if self.collect_basic_require(&declaration.declarations[0]) {
+            return Ok(self.ast.vec());
         }
 
-        self.collect_member_require(declarator)
+        let span = declaration.span;
+        let kind = declaration.kind;
+        let declare = declaration.declare;
+        let mut declarations = declaration.declarations.take_in(self.ast);
+        let declarator = declarations
+            .pop()
+            .expect("single-declaration vector should have one item");
+
+        match self.collect_member_require(declarator, span, kind, declare) {
+            Ok(replacements) => Ok(replacements),
+            Err(declarator) => {
+                declaration.declarations = self.ast.vec_from_array([declarator]);
+                Err(declaration)
+            }
+        }
     }
 
     fn collect_basic_require(&mut self, declarator: &VariableDeclarator<'a>) -> bool {
@@ -636,62 +664,161 @@ impl<'a> CommonJsImportTransformer<'a> {
         }
     }
 
-    fn collect_member_require(&mut self, declarator: &VariableDeclarator<'a>) -> bool {
+    fn collect_member_require(
+        &mut self,
+        declarator: VariableDeclarator<'a>,
+        declaration_span: Span,
+        declaration_kind: VariableDeclarationKind,
+        declaration_declare: bool,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, VariableDeclarator<'a>> {
         let Some(Expression::StaticMemberExpression(member)) = &declarator.init else {
-            return self.collect_computed_member_require(declarator);
+            return self.collect_computed_member_require(
+                declarator,
+                declaration_span,
+                declaration_kind,
+                declaration_declare,
+            );
         };
         let Some(source) = require_call_source(&member.object) else {
-            return false;
+            return Err(declarator);
         };
 
-        self.collect_member_require_import(&declarator.id, source, member.property.name.as_str())
+        let source = source.to_string();
+        let imported = member.property.name.as_str().to_string();
+        self.collect_member_require_import(
+            declarator,
+            &source,
+            &imported,
+            declaration_span,
+            declaration_kind,
+            declaration_declare,
+        )
     }
 
-    fn collect_computed_member_require(&mut self, declarator: &VariableDeclarator<'a>) -> bool {
+    fn collect_computed_member_require(
+        &mut self,
+        declarator: VariableDeclarator<'a>,
+        declaration_span: Span,
+        declaration_kind: VariableDeclarationKind,
+        declaration_declare: bool,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, VariableDeclarator<'a>> {
         let Some(Expression::ComputedMemberExpression(member)) = &declarator.init else {
-            return false;
+            return Err(declarator);
         };
         let Some(source) = require_call_source(&member.object) else {
-            return false;
+            return Err(declarator);
         };
         let Expression::StringLiteral(property) = &member.expression else {
-            return false;
+            return Err(declarator);
         };
 
-        self.collect_member_require_import(&declarator.id, source, property.value.as_str())
+        let source = source.to_string();
+        let imported = property.value.as_str().to_string();
+        self.collect_member_require_import(
+            declarator,
+            &source,
+            &imported,
+            declaration_span,
+            declaration_kind,
+            declaration_declare,
+        )
     }
 
     fn collect_member_require_import(
         &mut self,
-        id: &BindingPattern<'a>,
+        declarator: VariableDeclarator<'a>,
         source: &str,
         imported: &str,
-    ) -> bool {
+        declaration_span: Span,
+        declaration_kind: VariableDeclarationKind,
+        declaration_declare: bool,
+    ) -> std::result::Result<oxc_allocator::Vec<'a, Statement<'a>>, VariableDeclarator<'a>> {
         if imported != "default" && !is_valid_identifier_name(imported) {
-            return false;
+            return Err(declarator);
         }
 
-        match id {
+        match &declarator.id {
             BindingPattern::BindingIdentifier(identifier) if imported == "default" => {
                 self.imports.add_default(source, identifier.name.as_str());
-                true
+                Ok(self.ast.vec())
             }
             BindingPattern::BindingIdentifier(identifier) => {
                 self.imports
                     .add_named(source, imported, identifier.name.as_str());
-                true
+                Ok(self.ast.vec())
             }
             BindingPattern::ObjectPattern(_) if imported == "default" => {
-                let Some(imports) = named_imports_from_object_pattern(id) else {
-                    return false;
+                let Some(imports) = named_imports_from_object_pattern(&declarator.id) else {
+                    return Err(declarator);
                 };
                 for (imported, local) in imports {
                     self.imports.add_named(source, &imported, &local);
                 }
-                true
+                Ok(self.ast.vec())
             }
-            _ => false,
+            BindingPattern::ObjectPattern(_) => {
+                let local = if self.declared_names.contains(imported) {
+                    generate_name(imported, &self.declared_names)
+                } else {
+                    imported.to_string()
+                };
+                self.declared_names.insert(local.clone());
+                self.imports.add_named(source, imported, &local);
+
+                let init = self.identifier_expression(&local);
+                let replacement_declarator = self.variable_declarator(
+                    declarator.span,
+                    declaration_kind,
+                    declarator.id,
+                    init,
+                );
+                let replacement = self.variable_declaration_statement(
+                    declaration_span,
+                    declaration_kind,
+                    declaration_declare,
+                    replacement_declarator,
+                );
+                Ok(self.ast.vec_from_array([replacement]))
+            }
+            _ => Err(declarator),
         }
+    }
+
+    fn variable_declaration_statement(
+        &self,
+        span: Span,
+        kind: VariableDeclarationKind,
+        declare: bool,
+        declarator: VariableDeclarator<'a>,
+    ) -> Statement<'a> {
+        Statement::VariableDeclaration(self.ast.alloc_variable_declaration(
+            span,
+            kind,
+            self.ast.vec_from_array([declarator]),
+            declare,
+        ))
+    }
+
+    fn variable_declarator(
+        &self,
+        span: Span,
+        kind: VariableDeclarationKind,
+        id: BindingPattern<'a>,
+        init: Expression<'a>,
+    ) -> VariableDeclarator<'a> {
+        self.ast.variable_declarator(
+            span,
+            kind,
+            id,
+            None::<oxc_allocator::Box<'a, oxc_ast::ast::TSTypeAnnotation<'a>>>,
+            Some(init),
+            false,
+        )
+    }
+
+    fn identifier_expression(&self, name: &str) -> Expression<'a> {
+        self.ast
+            .expression_identifier(Span::default(), self.ast.ident(name))
     }
 }
 
@@ -1463,6 +1590,37 @@ import foo, { bar, baz as qux } from \"foo\";
 import baz from \"baz\";
 import { baz3 as baz1 } from \"baz2\";
 import \"side-effect\";
+",
+        );
+    }
+
+    #[test]
+    fn converts_require_property_access_destructuring() {
+        define_ast_inline_test(transform_ast)(
+            "
+var { bar } = require('foo').baz2;
+var baz1 = require('foo').baz3;
+",
+            "
+import { baz2, baz3 as baz1 } from \"foo\";
+var { bar } = baz2;
+",
+        );
+    }
+
+    #[test]
+    fn resolves_require_property_access_destructuring_conflict() {
+        define_ast_inline_test(transform_ast)(
+            "
+var { baz } = require('foo').bar;
+var bar = 1;
+console.log(bar);
+",
+            "
+import { bar as bar_1 } from \"foo\";
+var { baz } = bar_1;
+var bar = 1;
+console.log(bar);
 ",
         );
     }
