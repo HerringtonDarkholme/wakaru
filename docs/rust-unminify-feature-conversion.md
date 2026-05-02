@@ -214,7 +214,7 @@ This list records the audited migration order for the default `packages/unminify
 | 16 | `un-builtin-prototype` | done | AST mutate pass restoring literal receiver `.call`/`.apply` chains to built-in prototype method calls; wired. |
 | 17 | `un-flip-comparisons` | done | AST mutate pass reversing Yoda-style equality and relational comparisons when the left side is a simple constant/common value; wired. |
 | 18 | `un-sequence-expression` | done | AST mutate pass splitting sequence expressions across statement-list contexts, including expression statements, returns, control-flow tests, variable declarations, and loop headers; wired for all duplicate registry occurrences. |
-| 19 | `lebab` | pending | Intentionally skipped for now. Keep the mirrored no-op AST registry entry until an Oxc-native compatibility subset is designed. |
+| 19 | `lebab` | skipped | Do not port for now. Keep the mirrored no-op AST registry entry so the default registry remains traceable without spending migration time here. |
 | 20 | `un-export-rename` | done | Semantic transform merging top-level declaration aliases into named exports; uses Oxc symbol/reference IDs so recursive references are renamed while shadowed bindings are preserved; wired. |
 | 21 | `un-import-rename` | done | Semantic transform renaming import aliases back to imported names, with sequential conflict suffixes and symbol/reference-safe use-site updates; wired. |
 | 22 | `un-undefined` | done | Semantic transform converting numeric `void` expressions to `undefined` only when Oxc scope lookup confirms `undefined` is not declared in the current scope chain; wired. |
@@ -235,8 +235,8 @@ This list records the audited migration order for the default `packages/unminify
 | 37 | `un-parameters` | partial | Public composite registry entry is wired and currently runs the ported `un-default-parameter` and `un-parameter-rest` slices in TS order. |
 | 38 | `un-argument-spread` | done | AST mutate pass converting safe `fn.apply(undefined/null, args)` and receiver-matched `obj.fn.apply(obj, args)` / computed-member variants to spread calls; wired. |
 | 39 | `un-jsx` | partial | First AST slice converts classic `createElement`/`React.createElement` calls for string/component/member tags, null/object/spread props, simple boolean/string/expression attributes, spread props, and simple/nested children. Remaining gaps: automatic runtime, fragments, dynamic component hoisting, component renaming, constant tag inlining, React/Object spread helper flattening, pure annotation cleanup, and full formatting parity. |
-| 40 | `un-es6-class` | `Semantic transform` | Rebuild classes from constructor/prototype/static/getter/setter/extends shapes. |
-| 41 | `un-async-await` | `Semantic transform` | Reconstruct TypeScript `__generator` and `__awaiter`; control-flow heavy, migrate last. |
+| 40 | `un-es6-class` | skipped | Do not port for now. Keep the mirrored no-op AST registry entry; class reconstruction is large, helper-sensitive, and not worth prioritizing in the Rust migration. |
+| 41 | `un-async-await` | skipped | Do not port for now. Keep the mirrored no-op AST registry entry; reconstructing `__generator` / `__awaiter` is control-flow heavy and not worth prioritizing in the Rust migration. |
 | 42 | `oxfmt-1` | done | Final formatting pass. |
 
 `un-builtins` is intentionally not in this migration queue because it is not in the default TS registry and the TS implementation is a TODO stub. Keep its Rust skeleton for traceability, but do not wire it into the default pipeline until the feature exists upstream or a Rust-specific design is accepted.
