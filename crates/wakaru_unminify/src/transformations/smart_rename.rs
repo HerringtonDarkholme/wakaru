@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::{
     ast::{
-        BindingIdentifier, BindingPattern, BindingProperty, CallExpression, Expression,
-        IdentifierReference, PropertyKey, VariableDeclarator,
+        Argument, BindingIdentifier, BindingPattern, BindingProperty, CallExpression, Expression,
+        FormalParameters, IdentifierReference, PropertyKey, VariableDeclarator,
     },
     AstBuilder,
 };
@@ -47,7 +47,11 @@ struct DestructuringRenameCollector<'a, 's> {
 
 impl<'a> VisitMut<'a> for DestructuringRenameCollector<'a, '_> {
     fn visit_variable_declarator(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        self.rename_create_context(declarator);
+        self.rename_use_ref(declarator);
         self.rename_use_state_setter(declarator);
+        self.rename_use_reducer_pair(declarator);
+        self.rename_forward_ref_params(declarator);
         walk_mut::walk_variable_declarator(self, declarator);
     }
 
@@ -58,6 +62,44 @@ impl<'a> VisitMut<'a> for DestructuringRenameCollector<'a, '_> {
 }
 
 impl<'a> DestructuringRenameCollector<'a, '_> {
+    fn rename_create_context(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        let Some(call) = call_expression_init(declarator) else {
+            return;
+        };
+        if !is_react_call(call, "createContext") || call.arguments.len() > 1 {
+            return;
+        }
+
+        let BindingPattern::BindingIdentifier(identifier) = &mut declarator.id else {
+            return;
+        };
+        if identifier.name.len() > MINIFIED_IDENTIFIER_THRESHOLD {
+            return;
+        }
+
+        let old_name = identifier.name.as_str().to_string();
+        self.rename_binding_to_generated(identifier, &format!("{}Context", pascal_case(&old_name)));
+    }
+
+    fn rename_use_ref(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        let Some(call) = call_expression_init(declarator) else {
+            return;
+        };
+        if !is_react_call(call, "useRef") || call.arguments.len() > 1 {
+            return;
+        }
+
+        let BindingPattern::BindingIdentifier(identifier) = &mut declarator.id else {
+            return;
+        };
+        if identifier.name.len() > MINIFIED_IDENTIFIER_THRESHOLD {
+            return;
+        }
+
+        let old_name = identifier.name.as_str().to_string();
+        self.rename_binding_to_generated(identifier, &format!("{old_name}Ref"));
+    }
+
     fn rename_property(&mut self, property: &mut BindingProperty<'a>) {
         if property.computed {
             return;
@@ -87,11 +129,7 @@ impl<'a> DestructuringRenameCollector<'a, '_> {
         let scope_id = self.scoping.symbol_scope_id(symbol_id);
         let new_name = self.generate_target_name(scope_id, &key_name);
 
-        self.generated_names
-            .entry(scope_id)
-            .or_default()
-            .insert(new_name.clone());
-        self.renames.insert(symbol_id, new_name.clone());
+        self.record_symbol_rename(symbol_id, scope_id, &new_name);
         binding.name = self.ast.ident(&new_name);
         property.shorthand = new_name == key_name;
     }
@@ -135,12 +173,89 @@ impl<'a> DestructuringRenameCollector<'a, '_> {
         let new_name =
             self.generate_target_name(scope_id, &format!("set{}", pascal_case(base_name)));
 
+        self.record_symbol_rename(symbol_id, scope_id, &new_name);
+        setter.name = self.ast.ident(&new_name);
+    }
+
+    fn rename_use_reducer_pair(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        let Some(call) = call_expression_init(declarator) else {
+            return;
+        };
+        if !is_react_call(call, "useReducer") || !(2..=3).contains(&call.arguments.len()) {
+            return;
+        }
+
+        let BindingPattern::ArrayPattern(pattern) = &mut declarator.id else {
+            return;
+        };
+        if pattern.elements.len() != 2 {
+            return;
+        }
+
+        let Some(state) = optional_binding_identifier_mut(pattern.elements.get_mut(0)) else {
+            return;
+        };
+        if state.name.len() < MINIFIED_IDENTIFIER_THRESHOLD {
+            let old_name = state.name.as_str().to_string();
+            self.rename_binding_to_generated(state, &format!("{old_name}State"));
+        }
+
+        let Some(dispatch) = optional_binding_identifier_mut(pattern.elements.get_mut(1)) else {
+            return;
+        };
+        if dispatch.name.len() < MINIFIED_IDENTIFIER_THRESHOLD {
+            let old_name = dispatch.name.as_str().to_string();
+            self.rename_binding_to_generated(dispatch, &format!("{old_name}Dispatch"));
+        }
+    }
+
+    fn rename_forward_ref_params(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        let Some(call) = call_expression_init_mut(declarator) else {
+            return;
+        };
+        if !is_react_call(call, "forwardRef") || call.arguments.len() != 1 {
+            return;
+        }
+
+        let Some(params) = forwarded_ref_params_mut(call) else {
+            return;
+        };
+        if params.items.len() != 2 || params.rest.is_some() {
+            return;
+        }
+
+        let (props_params, ref_params) = params.items.split_at_mut(1);
+        let BindingPattern::BindingIdentifier(props) = &mut props_params[0].pattern else {
+            return;
+        };
+        let BindingPattern::BindingIdentifier(reference) = &mut ref_params[0].pattern else {
+            return;
+        };
+
+        if props.name.len() < MINIFIED_IDENTIFIER_THRESHOLD {
+            self.rename_binding_to_generated(props, "props");
+        }
+        if reference.name.len() < MINIFIED_IDENTIFIER_THRESHOLD {
+            self.rename_binding_to_generated(reference, "ref");
+        }
+    }
+
+    fn rename_binding_to_generated(&mut self, identifier: &mut BindingIdentifier<'a>, base: &str) {
+        let Some(symbol_id) = identifier.symbol_id.get() else {
+            return;
+        };
+        let scope_id = self.scoping.symbol_scope_id(symbol_id);
+        let new_name = self.generate_target_name(scope_id, base);
+        self.record_symbol_rename(symbol_id, scope_id, &new_name);
+        identifier.name = self.ast.ident(&new_name);
+    }
+
+    fn record_symbol_rename(&mut self, symbol_id: SymbolId, scope_id: ScopeId, new_name: &str) {
         self.generated_names
             .entry(scope_id)
             .or_default()
-            .insert(new_name.clone());
-        self.renames.insert(symbol_id, new_name.clone());
-        setter.name = self.ast.ident(&new_name);
+            .insert(new_name.to_string());
+        self.renames.insert(symbol_id, new_name.to_string());
     }
 
     fn generate_target_name(&self, scope_id: ScopeId, key_name: &str) -> String {
@@ -186,6 +301,24 @@ impl<'a> DestructuringRenameCollector<'a, '_> {
     }
 }
 
+fn call_expression_init<'b, 'a>(
+    declarator: &'b VariableDeclarator<'a>,
+) -> Option<&'b CallExpression<'a>> {
+    let Some(Expression::CallExpression(call)) = declarator.init.as_ref() else {
+        return None;
+    };
+    Some(call)
+}
+
+fn call_expression_init_mut<'b, 'a>(
+    declarator: &'b mut VariableDeclarator<'a>,
+) -> Option<&'b mut CallExpression<'a>> {
+    let Some(Expression::CallExpression(call)) = declarator.init.as_mut() else {
+        return None;
+    };
+    Some(call)
+}
+
 fn is_react_call(call: &CallExpression, hook_name: &str) -> bool {
     is_callee_name(&call.callee, hook_name)
 }
@@ -198,6 +331,17 @@ fn is_callee_name(expression: &Expression, name: &str) -> bool {
             is_callee_name(&parenthesized.expression, name)
         }
         _ => false,
+    }
+}
+
+fn forwarded_ref_params_mut<'b, 'a>(
+    call: &'b mut CallExpression<'a>,
+) -> Option<&'b mut FormalParameters<'a>> {
+    let argument = call.arguments.get_mut(0)?;
+    match argument {
+        Argument::ArrowFunctionExpression(arrow) => Some(&mut arrow.params),
+        Argument::FunctionExpression(function) => Some(&mut function.params),
+        _ => None,
     }
 }
 
@@ -464,6 +608,86 @@ const [, setG] = o.useState(0);
 const [value, h] = useState(1);
 const [{ value: value_1 }, j] = useState();
 const k = o.useState(a, b);
+",
+        );
+    }
+
+    #[test]
+    fn react_renames_create_context_bindings() {
+        define_ast_inline_test(transform_ast)(
+            "
+const d = createContext(null);
+const ef = o.createContext('light');
+const g = o.createContext(a, b, c);
+const ThemeContext = o.createContext('light');
+",
+            "
+const DContext = createContext(null);
+const EfContext = o.createContext(\"light\");
+const g = o.createContext(a, b, c);
+const ThemeContext = o.createContext(\"light\");
+",
+        );
+    }
+
+    #[test]
+    fn react_renames_use_ref_bindings() {
+        define_ast_inline_test(transform_ast)(
+            "
+const d = useRef();
+const ef = o.useRef(null);
+const g = o.useRef(a, b);
+const buttonRef = o.useRef(null);
+",
+            "
+const dRef = useRef();
+const efRef = o.useRef(null);
+const g = o.useRef(a, b);
+const buttonRef = o.useRef(null);
+",
+        );
+    }
+
+    #[test]
+    fn react_renames_use_reducer_bindings() {
+        define_ast_inline_test(transform_ast)(
+            "
+const [e, f] = useReducer(r, i);
+const [g, h] = o.useReducer(r, i, init);
+const [state, j] = useReducer(r, i);
+const [k, dispatch] = useReducer(r, i);
+const [l, m] = o.useReducer(a);
+",
+            "
+const [eState, fDispatch] = useReducer(r, i);
+const [gState, hDispatch] = o.useReducer(r, i, init);
+const [state, jDispatch] = useReducer(r, i);
+const [kState, dispatch] = useReducer(r, i);
+const [l, m] = o.useReducer(a);
+",
+        );
+    }
+
+    #[test]
+    fn react_renames_forward_ref_params() {
+        define_ast_inline_test(transform_ast)(
+            "
+const Z = forwardRef((e, t) => {
+  return e.label + t.current;
+});
+const X = o.forwardRef(function (e, ref2) {
+  return e.label + ref2.current;
+});
+const Y = o.forwardRef(a, b);
+",
+            "
+const Z = forwardRef((props, ref) => {
+  return props.label + ref.current;
+});
+const X = o.forwardRef(function(props, ref2) {
+  return props.label + ref2.current;
+});
+const Y = o.forwardRef(a, b);
 ",
         );
     }
