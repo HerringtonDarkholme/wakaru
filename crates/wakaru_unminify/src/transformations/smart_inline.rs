@@ -25,6 +25,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
         scoping,
         reconstruct_arrays: true,
         reconstruct_objects: true,
+        rename_property_paths: true,
         inline_globals: false,
         inline_temps: false,
     };
@@ -39,6 +40,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
         scoping,
         reconstruct_arrays: false,
         reconstruct_objects: false,
+        rename_property_paths: false,
         inline_globals: true,
         inline_temps: true,
     };
@@ -52,6 +54,7 @@ struct TempVariableInliner<'a> {
     scoping: Scoping,
     reconstruct_arrays: bool,
     reconstruct_objects: bool,
+    rename_property_paths: bool,
     inline_globals: bool,
     inline_temps: bool,
 }
@@ -64,6 +67,9 @@ impl<'a> VisitMut<'a> for TempVariableInliner<'a> {
         }
         if self.reconstruct_objects {
             self.reconstruct_object_destructuring(statements);
+        }
+        if self.rename_property_paths {
+            self.rename_single_property_access_paths(statements);
         }
         if self.inline_globals {
             self.inline_global_aliases(statements);
@@ -529,6 +535,41 @@ impl<'a> TempVariableInliner<'a> {
         Some((symbol_id, global_name.to_string()))
     }
 
+    fn rename_single_property_access_paths(
+        &mut self,
+        statements: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+    ) {
+        let mut generated_names = HashMap::<ScopeId, HashSet<String>>::new();
+
+        for index in 0..statements.len() {
+            let Some(candidate) = property_path_rename_candidate(&statements[index], &self.scoping)
+            else {
+                continue;
+            };
+
+            let new_name = self.generate_name_with_generated(
+                candidate.scope_id,
+                &candidate.base_name,
+                &generated_names,
+            );
+            generated_names
+                .entry(candidate.scope_id)
+                .or_default()
+                .insert(new_name.clone());
+
+            rename_binding_identifier(
+                &mut statements[index],
+                candidate.symbol_id,
+                self.ast,
+                &new_name,
+            );
+
+            let mut renames = HashMap::new();
+            renames.insert(candidate.symbol_id, new_name);
+            rename_references(self.ast, &self.scoping, statements, &renames);
+        }
+    }
+
     fn generate_name(&mut self, scope_id: ScopeId, raw_base: &str) -> String {
         let base = if is_valid_binding_identifier(raw_base) {
             raw_base.to_string()
@@ -552,6 +593,40 @@ impl<'a> TempVariableInliner<'a> {
 
     fn is_name_occupied(&self, scope_id: ScopeId, name: &str) -> bool {
         self.scoping.find_binding(scope_id, name.into()).is_some()
+    }
+
+    fn generate_name_with_generated(
+        &self,
+        scope_id: ScopeId,
+        raw_base: &str,
+        generated_names: &HashMap<ScopeId, HashSet<String>>,
+    ) -> String {
+        let base = if is_valid_binding_identifier(raw_base) {
+            raw_base.to_string()
+        } else {
+            format!("_{raw_base}")
+        };
+
+        if !self.is_name_occupied(scope_id, &base)
+            && !generated_names
+                .get(&scope_id)
+                .is_some_and(|names| names.contains(&base))
+        {
+            return base;
+        }
+
+        let mut index = 1;
+        loop {
+            let candidate = format!("{base}_{index}");
+            if !self.is_name_occupied(scope_id, &candidate)
+                && !generated_names
+                    .get(&scope_id)
+                    .is_some_and(|names| names.contains(&candidate))
+            {
+                return candidate;
+            }
+            index += 1;
+        }
     }
 
     fn inline_temp_variables(&self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
@@ -658,6 +733,12 @@ struct ObjectPropertyAccess<'a> {
     declarator_span: Span,
 }
 
+struct PropertyPathRenameCandidate {
+    symbol_id: SymbolId,
+    scope_id: ScopeId,
+    base_name: String,
+}
+
 fn push_object_access_group<'a>(
     ast: AstBuilder<'a>,
     groups: &mut Vec<ObjectDestructuringGroup<'a>>,
@@ -699,6 +780,91 @@ fn object_member_property<'b, 'a>(
             Some((&member.object, property.value.as_str().to_string()))
         }
         _ => None,
+    }
+}
+
+fn property_path_rename_candidate(
+    statement: &Statement,
+    scoping: &Scoping,
+) -> Option<PropertyPathRenameCandidate> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return None;
+    };
+    if declaration.declarations.len() != 1 || !is_supported_declaration_kind(declaration.kind) {
+        return None;
+    }
+
+    let declarator = &declaration.declarations[0];
+    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+        return None;
+    };
+    let symbol_id = identifier.symbol_id.get()?;
+    let scope_id = scoping.symbol_scope_id(symbol_id);
+    let base_name = member_expression_path_name(declarator.init.as_ref()?)?;
+
+    Some(PropertyPathRenameCandidate {
+        symbol_id,
+        scope_id,
+        base_name,
+    })
+}
+
+fn member_expression_path_name(expression: &Expression) -> Option<String> {
+    match expression {
+        Expression::StaticMemberExpression(member)
+            if matches!(member.object, Expression::Identifier(_)) =>
+        {
+            expression_path_name(expression)
+        }
+        Expression::ComputedMemberExpression(member)
+            if matches!(member.object, Expression::Identifier(_))
+                && matches!(
+                    member.expression,
+                    Expression::Identifier(_) | Expression::StringLiteral(_)
+                ) =>
+        {
+            expression_path_name(expression)
+        }
+        _ => None,
+    }
+}
+
+fn expression_path_name(expression: &Expression) -> Option<String> {
+    match expression {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str().to_string()),
+        Expression::StringLiteral(literal) => Some(literal.value.as_str().to_string()),
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}_{}",
+            expression_path_name(&member.object)?,
+            member.property.name
+        )),
+        Expression::ComputedMemberExpression(member) => Some(format!(
+            "{}_{}",
+            expression_path_name(&member.object)?,
+            expression_path_name(&member.expression)?
+        )),
+        _ => None,
+    }
+}
+
+fn rename_binding_identifier<'a>(
+    statement: &mut Statement<'a>,
+    symbol_id: SymbolId,
+    ast: AstBuilder<'a>,
+    new_name: &str,
+) {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return;
+    };
+    let Some(declarator) = declaration.declarations.get_mut(0) else {
+        return;
+    };
+    let BindingPattern::BindingIdentifier(identifier) = &mut declarator.id else {
+        return;
+    };
+
+    if identifier.symbol_id.get() == Some(symbol_id) {
+        identifier.name = ast.ident(new_name);
     }
 }
 
@@ -1093,6 +1259,27 @@ console.log(t, n, r);
             "
 const { x, y, color } = source;
 console.log(x, y, color);
+",
+        );
+    }
+
+    #[test]
+    fn renames_single_property_access_paths() {
+        define_ast_inline_test(transform_ast)(
+            "
+const t = s.target;
+const p = t.parentElement;
+const v = p.value;
+const x = v[index];
+
+const t2 = s.target.parentElement;
+",
+            "
+const s_target = s.target;
+const s_target_parentElement = s_target.parentElement;
+const s_target_parentElement_value = s_target_parentElement.value;
+const s_target_parentElement_value_index = s_target_parentElement_value[index];
+const t2 = s.target.parentElement;
 ",
         );
     }
