@@ -3,13 +3,13 @@ use std::collections::HashSet;
 use oxc_allocator::{CloneIn, TakeIn};
 use oxc_ast::{
     ast::{
-        Argument, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression,
-        ConditionalExpression, Expression, Statement,
+        Argument, ArrayExpressionElement, AssignmentExpression, AssignmentTarget, BindingPattern,
+        CallExpression, ConditionalExpression, Expression, Statement,
     },
     AstBuilder,
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::ParsedSourceFile;
@@ -146,7 +146,15 @@ impl<'a> OptionalChainingTransformer<'a> {
                     return self.optional_call_method(span, target, call);
                 }
 
-                if matches!(member.property.name.as_str(), "apply" | "bind") {
+                if member.property.name == "apply" {
+                    return self.optional_apply_call(
+                        span,
+                        target.clone_in(self.ast.allocator),
+                        call,
+                    );
+                }
+
+                if member.property.name == "bind" {
                     return None;
                 }
 
@@ -172,6 +180,11 @@ impl<'a> OptionalChainingTransformer<'a> {
                 );
                 self.optional_call(span, callee, call, 0, false)
             }
+            Expression::StaticMemberExpression(apply_member)
+                if apply_member.property.name == "apply" =>
+            {
+                self.optional_apply_member_call(span, target, temp_name, apply_member, call)
+            }
             _ => None,
         }
     }
@@ -189,6 +202,104 @@ impl<'a> OptionalChainingTransformer<'a> {
         }
 
         self.optional_call(span, target.clone_in(self.ast.allocator), call, 1, true)
+    }
+
+    fn optional_apply_member_call(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        apply_member: &oxc_ast::ast::StaticMemberExpression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        match without_parentheses(&apply_member.object) {
+            Expression::StaticMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                let expected_this = call_this_expression(target);
+                if !call.arguments.first().is_some_and(|argument| {
+                    argument_matches_expression(argument, expected_this)
+                        || argument_matches_identifier(argument, temp_name)
+                }) {
+                    return None;
+                }
+
+                let callee =
+                    Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
+                        member.span,
+                        target.clone_in(self.ast.allocator),
+                        member.property.clone_in(self.ast.allocator),
+                        true,
+                    ));
+                self.optional_apply_call(span, callee, call)
+            }
+            Expression::ComputedMemberExpression(member)
+                if identifier_name(&member.object) == Some(temp_name) =>
+            {
+                let expected_this = call_this_expression(target);
+                if !call.arguments.first().is_some_and(|argument| {
+                    argument_matches_expression(argument, expected_this)
+                        || argument_matches_identifier(argument, temp_name)
+                }) {
+                    return None;
+                }
+
+                let callee = Expression::ComputedMemberExpression(
+                    self.ast.alloc_computed_member_expression(
+                        member.span,
+                        target.clone_in(self.ast.allocator),
+                        member.expression.clone_in(self.ast.allocator),
+                        true,
+                    ),
+                );
+                self.optional_apply_call(span, callee, call)
+            }
+            _ => None,
+        }
+    }
+
+    fn optional_apply_call(
+        &self,
+        span: Span,
+        callee: Expression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let argument = call.arguments.get(1)?;
+        if matches!(argument, Argument::SpreadElement(_)) {
+            return None;
+        }
+
+        let arguments = self.apply_arguments(argument);
+        let expression = Expression::CallExpression(self.ast.alloc_call_expression_with_pure(
+            call.span,
+            callee,
+            call.type_arguments.clone_in(self.ast.allocator),
+            arguments,
+            true,
+            call.pure,
+        ));
+        let chain_element = expression.into_chain_element()?;
+        Some(self.ast.expression_chain(span, chain_element))
+    }
+
+    fn apply_arguments(&self, argument: &Argument<'a>) -> oxc_allocator::Vec<'a, Argument<'a>> {
+        if let Some(Expression::ArrayExpression(array)) = argument.as_expression() {
+            let mut arguments = self.ast.vec_with_capacity(array.elements.len());
+            for element in &array.elements {
+                arguments.push(array_element_to_argument(self.ast, element));
+            }
+            return arguments;
+        }
+
+        let mut arguments = self.ast.vec_with_capacity(1);
+        let Some(expression) = argument.as_expression() else {
+            return arguments;
+        };
+        arguments.push(
+            self.ast
+                .argument_spread_element(argument.span(), expression.clone_in(self.ast.allocator)),
+        );
+        arguments
     }
 
     fn optional_call(
@@ -358,6 +469,65 @@ fn identifier_null_check<'a, 'b>(
     None
 }
 
+fn array_element_to_argument<'a>(
+    ast: AstBuilder<'a>,
+    element: &ArrayExpressionElement<'a>,
+) -> Argument<'a> {
+    match element {
+        ArrayExpressionElement::SpreadElement(spread) => {
+            Argument::SpreadElement(spread.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::Elision(elision) => {
+            expression_to_argument(ast.expression_identifier(elision.span, ast.ident("undefined")))
+        }
+        ArrayExpressionElement::BooleanLiteral(value) => {
+            Argument::BooleanLiteral(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::NullLiteral(value) => {
+            Argument::NullLiteral(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::NumericLiteral(value) => {
+            Argument::NumericLiteral(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::StringLiteral(value) => {
+            Argument::StringLiteral(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::Identifier(value) => {
+            Argument::Identifier(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::ThisExpression(value) => {
+            Argument::ThisExpression(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::StaticMemberExpression(value) => {
+            Argument::StaticMemberExpression(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::ComputedMemberExpression(value) => {
+            Argument::ComputedMemberExpression(value.clone_in(ast.allocator))
+        }
+        ArrayExpressionElement::CallExpression(value) => {
+            Argument::CallExpression(value.clone_in(ast.allocator))
+        }
+        _ => expression_to_argument(
+            ast.expression_identifier(element.span(), ast.ident("undefined")),
+        ),
+    }
+}
+
+fn expression_to_argument<'a>(expression: Expression<'a>) -> Argument<'a> {
+    match expression {
+        Expression::BooleanLiteral(value) => Argument::BooleanLiteral(value),
+        Expression::NullLiteral(value) => Argument::NullLiteral(value),
+        Expression::NumericLiteral(value) => Argument::NumericLiteral(value),
+        Expression::StringLiteral(value) => Argument::StringLiteral(value),
+        Expression::Identifier(value) => Argument::Identifier(value),
+        Expression::ThisExpression(value) => Argument::ThisExpression(value),
+        Expression::StaticMemberExpression(value) => Argument::StaticMemberExpression(value),
+        Expression::ComputedMemberExpression(value) => Argument::ComputedMemberExpression(value),
+        Expression::CallExpression(value) => Argument::CallExpression(value),
+        _ => unreachable!("only supported expression variants are converted to arguments"),
+    }
+}
+
 fn assignment_null_check<'a, 'b>(
     expression: &'b Expression<'a>,
 ) -> Option<(&'b str, &'b Expression<'a>)> {
@@ -443,6 +613,14 @@ fn argument_matches_expression(argument: &Argument, expression: &Expression) -> 
     };
 
     expressions_match(argument, expression)
+}
+
+fn argument_matches_identifier(argument: &Argument, name: &str) -> bool {
+    let Some(Expression::Identifier(identifier)) = argument.as_expression() else {
+        return false;
+    };
+
+    identifier.name == name
 }
 
 fn expressions_match(left: &Expression, right: &Expression) -> bool {
@@ -589,6 +767,23 @@ var _foo, _bar;
             "
 foo?.(bar);
 foo.bar?.(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_apply_optional_calls() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo, _bar, _baz;
+(_foo = foo) === null || _foo === void 0 ? void 0 : _foo.apply(void 0, args);
+(_bar = foo.bar) === null || _bar === void 0 ? void 0 : _bar.apply(foo, [baz, qux]);
+(_baz = foo) === null || _baz === void 0 || _baz.bar.apply(_baz, args);
+",
+            "
+foo?.(...args);
+foo.bar?.(baz, qux);
+foo?.bar?.(...args);
 ",
         );
     }
