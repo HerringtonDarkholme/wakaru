@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::{Box as OxcBox, CloneIn, TakeIn};
 use oxc_ast::{
     ast::{
-        BindingPattern, BindingProperty, BindingRestElement, Expression, IdentifierReference,
-        PropertyKey, Statement, TSTypeAnnotation, VariableDeclaration, VariableDeclarationKind,
-        VariableDeclarator,
+        BindingPattern, BindingProperty, BindingRestElement, Comment, Expression,
+        IdentifierReference, PropertyKey, Statement, TSTypeAnnotation, VariableDeclaration,
+        VariableDeclarationKind, VariableDeclarator,
     },
     AstBuilder,
 };
@@ -28,8 +28,13 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
         rename_property_paths: true,
         inline_globals: false,
         inline_temps: false,
+        comment_moves: Vec::new(),
     };
     array_destructurer.visit_program(&mut source.program);
+    apply_comment_attachment_moves(
+        &mut source.program.comments,
+        &array_destructurer.comment_moves,
+    );
 
     let scoping = SemanticBuilder::new()
         .build(&source.program)
@@ -43,8 +48,10 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
         rename_property_paths: false,
         inline_globals: true,
         inline_temps: true,
+        comment_moves: Vec::new(),
     };
     inliner.visit_program(&mut source.program);
+    apply_comment_attachment_moves(&mut source.program.comments, &inliner.comment_moves);
 
     Ok(())
 }
@@ -57,6 +64,7 @@ struct TempVariableInliner<'a> {
     rename_property_paths: bool,
     inline_globals: bool,
     inline_temps: bool,
+    comment_moves: Vec<CommentAttachmentMove>,
 }
 
 impl<'a> VisitMut<'a> for TempVariableInliner<'a> {
@@ -82,7 +90,7 @@ impl<'a> VisitMut<'a> for TempVariableInliner<'a> {
 
 impl<'a> TempVariableInliner<'a> {
     fn reconstruct_array_destructuring(
-        &self,
+        &mut self,
         statements: &mut oxc_allocator::Vec<'a, Statement<'a>>,
     ) {
         if statements.len() < 2 {
@@ -96,6 +104,13 @@ impl<'a> TempVariableInliner<'a> {
 
         let mut remove_statement = vec![false; statements.len()];
         for group in &groups {
+            self.merge_removed_statement_comments(
+                group
+                    .accesses
+                    .iter()
+                    .map(|access| access.declaration_span.start),
+                group.span.start,
+            );
             for access in &group.accesses {
                 remove_statement[access.statement_index] = true;
             }
@@ -260,6 +275,10 @@ impl<'a> TempVariableInliner<'a> {
         let mut renames = HashMap::new();
 
         for group in &groups {
+            self.merge_removed_statement_comments(
+                group.accesses.iter().map(|access| access.span.start),
+                group.span.start,
+            );
             for access in &group.accesses {
                 remove_statement[access.statement_index] = true;
                 if let Some(symbol_id) = access.binding_symbol_id {
@@ -629,7 +648,7 @@ impl<'a> TempVariableInliner<'a> {
         }
     }
 
-    fn inline_temp_variables(&self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+    fn inline_temp_variables(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
         if statements.len() < 2 {
             return;
         }
@@ -650,6 +669,15 @@ impl<'a> TempVariableInliner<'a> {
             }
 
             replace_single_const_initializer(&mut statements[index], previous_init);
+            if let (Some(previous_start), Some(current_start)) = (
+                variable_declaration_span_start(&statements[index - 1]),
+                variable_declaration_span_start(&statements[index]),
+            ) {
+                self.comment_moves.push(CommentAttachmentMove {
+                    from: previous_start,
+                    to: current_start,
+                });
+            }
             remove_statement[index - 1] = true;
         }
 
@@ -686,6 +714,26 @@ impl<'a> TempVariableInliner<'a> {
         let init = declarator.init.as_ref()?;
         Some((symbol_id, init.clone_in(self.ast.allocator)))
     }
+
+    fn merge_removed_statement_comments(
+        &mut self,
+        starts: impl IntoIterator<Item = u32>,
+        target_start: u32,
+    ) {
+        for start in starts {
+            if start != target_start {
+                self.comment_moves.push(CommentAttachmentMove {
+                    from: start,
+                    to: target_start,
+                });
+            }
+        }
+    }
+}
+
+struct CommentAttachmentMove {
+    from: u32,
+    to: u32,
 }
 
 struct ArrayDestructuringGroup<'a> {
@@ -865,6 +913,23 @@ fn rename_binding_identifier<'a>(
 
     if identifier.symbol_id.get() == Some(symbol_id) {
         identifier.name = ast.ident(new_name);
+    }
+}
+
+fn apply_comment_attachment_moves(
+    comments: &mut oxc_allocator::Vec<Comment>,
+    moves: &[CommentAttachmentMove],
+) {
+    if moves.is_empty() {
+        return;
+    }
+
+    for comment in comments {
+        for comment_move in moves {
+            if comment.attached_to == comment_move.from {
+                comment.attached_to = comment_move.to;
+            }
+        }
     }
 }
 
@@ -1057,6 +1122,14 @@ fn replace_single_const_initializer<'a>(statement: &mut Statement<'a>, init: Exp
     declarator.init = Some(init);
 }
 
+fn variable_declaration_span_start(statement: &Statement) -> Option<u32> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return None;
+    };
+
+    Some(declaration.span.start)
+}
+
 fn single_const_declarator<'a>(statement: &'a Statement) -> Option<&'a VariableDeclarator<'a>> {
     let Statement::VariableDeclaration(declaration) = statement else {
         return None;
@@ -1090,6 +1163,26 @@ const g = r;
 ",
             "
 const n = e;
+const g = 1;
+",
+        );
+    }
+
+    #[test]
+    fn inlines_adjacent_temp_variable_assignments_with_comments() {
+        define_ast_inline_test(transform_ast)(
+            "
+// comment
+const o = 1;
+// comment2
+const r = o;
+// comment3
+const g = r;
+",
+            "
+// comment
+// comment2
+// comment3
 const g = 1;
 ",
         );
@@ -1178,6 +1271,28 @@ console.log(t, n, r);
     }
 
     #[test]
+    fn reconstructs_array_destructuring_with_comments() {
+        define_ast_inline_test(transform_ast)(
+            "
+// comment
+const t = e[0];
+// comment2
+const n = e[1];
+// comment3
+const r = e[2];
+console.log(t, n, r);
+",
+            "
+// comment
+// comment2
+// comment3
+const [t, n, r] = e;
+console.log(t, n, r);
+",
+        );
+    }
+
+    #[test]
     fn reconstructs_array_destructuring_with_gaps() {
         define_ast_inline_test(transform_ast)(
             "
@@ -1223,6 +1338,29 @@ e.type;
 console.log(t, n, r);
 ",
             "
+const { x, y, color, type } = e;
+console.log(x, y, color);
+",
+        );
+    }
+
+    #[test]
+    fn reconstructs_object_destructuring_with_comments() {
+        define_ast_inline_test(transform_ast)(
+            "
+// comment
+const t = e.x;
+// comment2
+const n = e.y;
+// comment3
+const r = e.color;
+e.type;
+console.log(t, n, r);
+",
+            "
+// comment
+// comment2
+// comment3
 const { x, y, color, type } = e;
 console.log(x, y, color);
 ",
