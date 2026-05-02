@@ -119,5 +119,7 @@ pub fn parse_program<'a>(
 }
 
 pub fn source_type_for_path(path: &Path) -> SourceType {
-    SourceType::from_path(path).unwrap_or_else(|_| SourceType::default().with_jsx(true))
+    SourceType::from_path(path)
+        .unwrap_or_default()
+        .with_jsx(true)
 }

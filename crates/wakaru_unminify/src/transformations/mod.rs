@@ -98,7 +98,7 @@ pub const DEFAULT_TRANSFORMATION_REGISTRY: &[TransformationDescriptor] = &[
     ),
     TransformationDescriptor::ast("un-parameters", un_parameters::transform_ast),
     TransformationDescriptor::ast("un-argument-spread", un_argument_spread::transform_ast),
-    TransformationDescriptor::ast("un-jsx", pending_ast_transform),
+    TransformationDescriptor::ast("un-jsx", un_jsx::transform_ast),
     TransformationDescriptor::ast("un-es6-class", pending_ast_transform),
     TransformationDescriptor::ast("un-async-await", pending_ast_transform),
     TransformationDescriptor::string("oxfmt-1", oxfmt::transform),

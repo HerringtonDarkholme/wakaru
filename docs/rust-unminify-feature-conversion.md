@@ -234,7 +234,7 @@ This list records the audited migration order for the default `packages/unminify
 | 36 | `un-parameter-rest` | partial | First semantic slice converts parameterless non-arrow functions that use implicit `arguments` into `...args`, including references from nested arrows, while skipping parent/current/child `args` conflicts. Remaining gaps: exact upstream scope edge parity and broader generated rest-loop recognition. |
 | 37 | `un-parameters` | partial | Public composite registry entry is wired and currently runs the ported `un-default-parameter` and `un-parameter-rest` slices in TS order. |
 | 38 | `un-argument-spread` | done | AST mutate pass converting safe `fn.apply(undefined/null, args)` and receiver-matched `obj.fn.apply(obj, args)` / computed-member variants to spread calls; wired. |
-| 39 | `un-jsx` | `Semantic transform` | Convert React classic and automatic runtime calls to JSX. |
+| 39 | `un-jsx` | partial | First AST slice converts classic `createElement`/`React.createElement` calls for string/component/member tags, null/object/spread props, simple boolean/string/expression attributes, spread props, and simple/nested children. Remaining gaps: automatic runtime, fragments, dynamic component hoisting, component renaming, constant tag inlining, React/Object spread helper flattening, pure annotation cleanup, and full formatting parity. |
 | 40 | `un-es6-class` | `Semantic transform` | Rebuild classes from constructor/prototype/static/getter/setter/extends shapes. |
 | 41 | `un-async-await` | `Semantic transform` | Reconstruct TypeScript `__generator` and `__awaiter`; control-flow heavy, migrate last. |
 | 42 | `oxfmt-1` | done | Final formatting pass. |
