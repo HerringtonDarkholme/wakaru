@@ -8,7 +8,7 @@ use oxc_ast::{
     },
     AstBuilder,
 };
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::{ParsedSourceFile, SyntheticTrailingComment};
@@ -18,6 +18,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     let mut transformer = EnumTransformer {
         ast,
         enum_counts: HashMap::new(),
+        source_code: &source.source.code,
         synthetic_replacements: &mut source.synthetic_trailing_comments,
     };
 
@@ -29,6 +30,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
 struct EnumTransformer<'a, 'b> {
     ast: AstBuilder<'a>,
     enum_counts: HashMap<String, usize>,
+    source_code: &'b str,
     synthetic_replacements: &'b mut Vec<SyntheticTrailingComment>,
 }
 
@@ -92,6 +94,7 @@ impl<'a> EnumTransformer<'a, '_> {
             self.ast,
             &enum_name,
             false,
+            self.source_code,
             self.synthetic_replacements,
         ) else {
             return Err(Statement::VariableDeclaration(declaration));
@@ -134,6 +137,7 @@ impl<'a> EnumTransformer<'a, '_> {
             &alias_name,
             &enum_name,
             should_add_spread,
+            self.source_code,
             self.synthetic_replacements,
         ) else {
             return Err(Statement::VariableDeclaration(declaration));
@@ -171,6 +175,7 @@ impl<'a> EnumTransformer<'a, '_> {
                     self.ast,
                     &enum_name,
                     should_add_spread,
+                    self.source_code,
                     self.synthetic_replacements,
                 ) else {
                     return Err(Statement::ExpressionStatement(statement));
@@ -209,6 +214,7 @@ impl<'a> EnumTransformer<'a, '_> {
             self.ast,
             &enum_name,
             should_add_spread,
+            self.source_code,
             self.synthetic_replacements,
         ) else {
             return Err(Statement::VariableDeclaration(declaration));
@@ -332,6 +338,7 @@ fn enum_object_from_statement_iife<'a>(
     ast: AstBuilder<'a>,
     enum_name: &str,
     should_add_spread: bool,
+    source_code: &str,
     synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
 ) -> Option<Expression<'a>> {
     let Statement::ExpressionStatement(statement) = statement else {
@@ -342,6 +349,7 @@ fn enum_object_from_statement_iife<'a>(
         ast,
         enum_name,
         should_add_spread,
+        source_code,
         synthetic_replacements,
     )
 }
@@ -351,6 +359,7 @@ fn enum_object_from_expression_iife<'a>(
     ast: AstBuilder<'a>,
     enum_name: &str,
     should_add_spread: bool,
+    source_code: &str,
     synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
 ) -> Option<Expression<'a>> {
     let call = iife_call_expression(expression)?;
@@ -362,6 +371,7 @@ fn enum_object_from_expression_iife<'a>(
     let statements = iife_body_statements(call)?;
     let mut forward_properties = ast.vec();
     let mut reverse_properties = ast.vec();
+    let mut added_reverse_mapping_comment = false;
 
     for statement in statements {
         if is_returning_internal_name(statement, internal_name) {
@@ -370,16 +380,25 @@ fn enum_object_from_expression_iife<'a>(
 
         let assignment = expression_statement_assignment(statement)?;
         let right_name = string_literal_value(&assignment.right)?;
+        let property_span = statement.span();
 
         if let Some(property) =
-            direct_string_enum_property(assignment, ast, internal_name, right_name)
+            direct_string_enum_property(assignment, ast, internal_name, right_name, property_span)
         {
             forward_properties.push(property);
             continue;
         }
 
-        let (forward_property, reverse_property) =
-            numeric_enum_properties(assignment, ast, internal_name, right_name)?;
+        let (forward_property, reverse_property) = numeric_enum_properties(
+            assignment,
+            ast,
+            internal_name,
+            right_name,
+            property_span,
+            source_code,
+            &mut added_reverse_mapping_comment,
+            synthetic_replacements,
+        )?;
         forward_properties.push(forward_property);
         reverse_properties.push(reverse_property);
     }
@@ -404,11 +423,13 @@ fn enum_object_from_compressed_assignments<'a>(
     alias_name: &str,
     enum_name: &str,
     should_add_spread: bool,
+    source_code: &str,
     synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
 ) -> Option<(Expression<'a>, usize)> {
     let mut forward_properties = ast.vec();
     let mut reverse_properties = ast.vec();
     let mut consumed_assignments = 0;
+    let mut added_reverse_mapping_comment = false;
 
     for statement in statements.iter().skip(2) {
         let Some(assignment) = expression_statement_assignment(statement) else {
@@ -417,17 +438,26 @@ fn enum_object_from_compressed_assignments<'a>(
         let Some(right_name) = string_literal_value(&assignment.right) else {
             break;
         };
+        let property_span = statement.span();
 
-        if let Some(property) = direct_string_enum_property(assignment, ast, alias_name, right_name)
+        if let Some(property) =
+            direct_string_enum_property(assignment, ast, alias_name, right_name, property_span)
         {
             forward_properties.push(property);
             consumed_assignments += 1;
             continue;
         }
 
-        if let Some((forward_property, reverse_property)) =
-            numeric_enum_properties(assignment, ast, alias_name, right_name)
-        {
+        if let Some((forward_property, reverse_property)) = numeric_enum_properties(
+            assignment,
+            ast,
+            alias_name,
+            right_name,
+            property_span,
+            source_code,
+            &mut added_reverse_mapping_comment,
+            synthetic_replacements,
+        ) {
             forward_properties.push(forward_property);
             reverse_properties.push(reverse_property);
             consumed_assignments += 1;
@@ -527,6 +557,7 @@ fn direct_string_enum_property<'a>(
     ast: AstBuilder<'a>,
     internal_name: &str,
     _right_name: &str,
+    span: Span,
 ) -> Option<ObjectPropertyKind<'a>> {
     let (object_name, key) = assignment_member_key(&assignment.left)?;
     if object_name != internal_name || key.is_assignment_expression() {
@@ -536,6 +567,7 @@ fn direct_string_enum_property<'a>(
     let (key, computed) = key.into_property_key(ast)?;
     Some(object_property(
         ast,
+        span,
         key,
         assignment.right.clone_in(ast.allocator),
         computed,
@@ -547,6 +579,10 @@ fn numeric_enum_properties<'a>(
     ast: AstBuilder<'a>,
     internal_name: &str,
     right_name: &str,
+    forward_span: Span,
+    source_code: &str,
+    added_reverse_mapping_comment: &mut bool,
+    synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
 ) -> Option<(ObjectPropertyKind<'a>, ObjectPropertyKind<'a>)> {
     let AssignmentTarget::ComputedMemberExpression(outer_member) = &assignment.left else {
         return None;
@@ -571,6 +607,7 @@ fn numeric_enum_properties<'a>(
     let (forward_key, forward_computed) = key.into_property_key(ast)?;
     let forward_property = object_property(
         ast,
+        forward_span,
         forward_key,
         inner_assignment.right.clone_in(ast.allocator),
         forward_computed,
@@ -580,10 +617,21 @@ fn numeric_enum_properties<'a>(
         expression_as_property_key(&inner_assignment.right, ast, true)?;
     let reverse_property = object_property(
         ast,
+        Span::default(),
         reverse_key,
         assignment.right.clone_in(ast.allocator),
         reverse_computed,
     );
+
+    if !*added_reverse_mapping_comment {
+        add_reverse_mapping_comment(
+            &inner_assignment.right,
+            right_name,
+            source_code,
+            synthetic_replacements,
+        );
+        *added_reverse_mapping_comment = true;
+    }
 
     Some((forward_property, reverse_property))
 }
@@ -688,18 +736,56 @@ fn expression_as_property_key<'a>(
 
 fn object_property<'a>(
     ast: AstBuilder<'a>,
+    span: Span,
     key: PropertyKey<'a>,
     value: Expression<'a>,
     computed: bool,
 ) -> ObjectPropertyKind<'a> {
     ast.object_property_kind_object_property(
-        Span::default(),
+        span,
         PropertyKind::Init,
         key,
         value,
         false,
         false,
         computed,
+    )
+}
+
+fn add_reverse_mapping_comment(
+    expression: &Expression,
+    right_name: &str,
+    source_code: &str,
+    synthetic_replacements: &mut Vec<SyntheticTrailingComment>,
+) {
+    let Some(key) = expression_source(expression, source_code) else {
+        return;
+    };
+    let candidate = if is_plain_reverse_property_key(expression) {
+        format!("{key}: \"{right_name}\"")
+    } else {
+        format!("[{key}]: \"{right_name}\"")
+    };
+
+    synthetic_replacements.push(SyntheticTrailingComment {
+        candidates: vec![candidate.clone()],
+        replacement: format!("// reverse mapping\n  {candidate}"),
+    });
+}
+
+fn expression_source(expression: &Expression, source_code: &str) -> Option<String> {
+    let span = expression.span();
+    source_code
+        .get(span.start as usize..span.end as usize)
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+}
+
+fn is_plain_reverse_property_key(expression: &Expression) -> bool {
+    matches!(
+        without_parentheses(expression),
+        Expression::NumericLiteral(_) | Expression::StringLiteral(_)
     )
 }
 
@@ -799,6 +885,7 @@ var Direction = {
   Up: 1,
   Down: 2,
   Right: -4,
+  // reverse mapping
   1: \"Up\",
   2: \"Down\",
   [-4]: \"Right\"
@@ -844,6 +931,7 @@ var RenderMode;
 var RenderMode = {
   \"2D\": 1,
   WebGL: 2,
+  // reverse mapping
   1: \"2D\",
   2: \"WebGL\"
 };
@@ -869,6 +957,7 @@ var Direction;
 var Direction = {
   Up: -1,
   Down: \"DOWN\",
+  // reverse mapping
   [-1]: \"Up\"
 };
 Direction = {
@@ -905,11 +994,13 @@ var Direction = ((m) => {
 var o = {
   Up: 1,
   Down: \"DOWN\",
+  // reverse mapping
   1: \"Up\"
 };
 var Direction = {
   Up: 1,
   Down: \"DOWN\",
+  // reverse mapping
   1: \"Up\"
 };
 var Direction = {
@@ -935,7 +1026,37 @@ Direction1.Down = \"DOWN\";
 var Direction = {
   Up: 1,
   Down: \"DOWN\",
+  // reverse mapping
   1: \"Up\"
+};
+",
+        );
+    }
+
+    #[test]
+    fn preserves_member_comments() {
+        define_ast_inline_test(transform_ast)(
+            "
+var FileAccess;
+(function (FileAccess) {
+  // constant members
+  FileAccess[FileAccess[\"Read\"] = 2] = \"Read\";
+  FileAccess[FileAccess[\"Write\"] = 4] = \"Write\";
+  // computed member
+  FileAccess[FileAccess[\"G\"] = \"123\".length] = \"G\";
+})(FileAccess || (FileAccess = {}));
+",
+            "
+var FileAccess = {
+  // constant members
+  Read: 2,
+  Write: 4,
+  // computed member
+  G: \"123\".length,
+  // reverse mapping
+  2: \"Read\",
+  4: \"Write\",
+  [\"123\".length]: \"G\"
 };
 ",
         );

@@ -222,7 +222,7 @@ This list records the audited migration order for the default `packages/unminify
 | 24 | `un-runtime-helper` | done | Runs the ported Babel helper core subset and annotates top-level helper functions from module metadata. Composite behavior was audited after `create-for-of` loop-function support landed; no additional wrapper changes were needed. |
 | 25 | Babel interop helpers | done | Standalone AST helper transforms for `interopRequireDefault` and `interopRequireWildcard` are ported with default-member cleanup and namespace-import hint preservation. They remain intentionally outside `un-runtime-helper`, matching the TS structure, and are ready for `un-esm` integration. |
 | 26 | `un-esm` | partial | Runs Babel interop default/wildcard helpers, rebuilds existing imports plus top-level static `require` declarations/side-effect calls, dedupes named/bare imports, annotates numeric `require(id)` as missing, and restores `Promise.resolve().then(() => require("x"))` dynamic imports. Remaining gaps: namespace import hints, hoist/fuzzy require, CJS export conversion, and scope-safe conflict resolution for destructuring property access. |
-| 27 | `un-enum` | partial | AST pass wired for the common TypeScript enum IIFE forms: declaration-paired IIFEs, mangled parameter names, string/numeric/heterogeneous members, invalid identifier keys, declaration merging with spread, terser `!function` calls, esbuild arrow IIFE variable initializers, and SWC compressed assignment forms. Remaining gap: comment relocation parity. |
+| 27 | `un-enum` | done | AST pass wired for the common TypeScript enum IIFE forms: declaration-paired IIFEs, mangled parameter names, string/numeric/heterogeneous members, invalid identifier keys, declaration merging with spread, terser `!function` calls, esbuild arrow IIFE variable initializers, SWC compressed assignment forms, source comment relocation, and reverse mapping comments. |
 | 28 | `un-indirect-call` | done | Semantic transform for ESM default imports and top-level CJS `require` namespaces: indirect member calls become direct named calls, named imports/destructures are reused or inserted, local conflicts get aliases, shadowed locals are ignored via Oxc symbol IDs, and default imports are removed only when all references were converted. |
 | 29 | `un-iife` | done | Semantic transform for top-level IIFEs: single-character params are renamed from longer identifier arguments using Oxc symbol/reference IDs, and literal arguments are moved into leading `const` declarations when `arguments` is not used. |
 | 30 | `smart-rename` | partial | Semantic slice is wired for object destructuring aliases in variable declarations and function parameters, plus React `useState` setter renaming for short state names. It renames binding symbols and references to property names, resolves conflicts with suffixes, and prefixes reserved/invalid binding names. Remaining gaps: broader React ecosystem heuristics. |
@@ -240,6 +240,22 @@ This list records the audited migration order for the default `packages/unminify
 | 42 | `oxfmt-1` | done | Final formatting pass. |
 
 `un-builtins` is intentionally not in this migration queue because it is not in the default TS registry and the TS implementation is a TODO stub. Keep its Rust skeleton for traceability, but do not wire it into the default pipeline until the feature exists upstream or a Rust-specific design is accepted.
+
+## Active Partial-Pass TODOs
+
+Work this list one pass at a time. Each item must either become `done` in the ordered log with focused tests, or be reclassified as `skipped` with the reason recorded.
+
+| Order | Transform | Remaining Work |
+| ---: | --- | --- |
+| 26 | `un-esm` | Namespace import hints, hoist/fuzzy require, CJS export conversion, and scope-safe conflict resolution for destructuring property access. |
+| 30 | `smart-rename` | Broader React ecosystem heuristics. |
+| 31 | `smart-inline` | Object destructuring reconstruction, global identifier inlining, comments parity, and generated-name conflict handling for destructuring. |
+| 32 | `un-optional-chaining` | Logical `&&`/`||` truthy forms, nested decision-tree splitting, `.apply`/`.bind`, delete, spread, parenthesized container parity, and semantic cleanup beyond simple temp declarations. |
+| 33 | `un-nullish-coalescing` | Full decision-tree splitting, nested coalescing chains, negated forms, optional-chaining interaction beyond simple expressions, and broader temp cleanup. |
+| 34 | `un-conditionals` | Broader nested decision-tree rendering, switch reconstruction, logical trees beyond one level, and statement-container parity. |
+| 35 | `un-default-parameter` | Broader scope/reference safety, exact TS generated-name parity, rest interaction, and full statement-container parity. |
+| 36 | `un-parameter-rest` / `un-parameters` | Exact upstream scope edge parity for rest conversion and composite verification after parameter slices are complete. |
+| 39 | `un-jsx` | Automatic runtime, fragments with attributes beyond component fallback, dynamic component hoisting, component renaming, constant tag inlining, React/Object spread helper flattening, pure annotation cleanup, and full formatting parity. |
 
 ## Example: `un-use-strict`
 
