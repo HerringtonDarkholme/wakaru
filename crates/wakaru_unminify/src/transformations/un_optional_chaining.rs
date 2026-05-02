@@ -36,6 +36,8 @@ impl<'a> VisitMut<'a> for OptionalChainingTransformer<'a> {
 
         if let Some(replacement) = self.convert_conditional_expression(expression) {
             *expression = replacement;
+        } else if let Some(replacement) = self.convert_logical_expression(expression) {
+            *expression = replacement;
         }
     }
 
@@ -63,6 +65,32 @@ impl<'a> OptionalChainingTransformer<'a> {
         )?;
 
         self.unused_temps.insert(temp_name.to_string());
+        Some(replacement)
+    }
+
+    fn convert_logical_expression(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<Expression<'a>> {
+        let Expression::LogicalExpression(logical) = expression else {
+            return None;
+        };
+        if logical.operator != LogicalOperator::Or {
+            return None;
+        }
+
+        let guard = optional_or_guard(&logical.left)?;
+        let replacement = self.optional_chain_expression(
+            logical.span,
+            guard.target,
+            guard.temp_name,
+            without_parentheses(&logical.right),
+        )?;
+
+        if let Some(temp_name) = guard.unused_temp {
+            self.unused_temps.insert(temp_name.to_string());
+        }
+
         Some(replacement)
     }
 
@@ -262,6 +290,72 @@ fn optional_member_guard<'a, 'b>(
     }
 
     Some((temp_name, target))
+}
+
+struct OptionalOrGuard<'a, 'b> {
+    temp_name: &'b str,
+    target: &'b Expression<'a>,
+    unused_temp: Option<&'b str>,
+}
+
+fn optional_or_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalOrGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::Or {
+        return None;
+    }
+
+    if let Some((temp_name, target)) = assignment_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: Some(temp_name),
+            });
+        }
+    }
+
+    if let Some((temp_name, target)) = identifier_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn identifier_null_check<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<(&'b str, &'b Expression<'a>)> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_equality_operator(binary.operator) {
+        return None;
+    }
+
+    if matches!(
+        without_parentheses(&binary.right),
+        Expression::NullLiteral(_)
+    ) {
+        let name = identifier_name(&binary.left)?;
+        return Some((name, without_parentheses(&binary.left)));
+    }
+
+    if matches!(
+        without_parentheses(&binary.left),
+        Expression::NullLiteral(_)
+    ) {
+        let name = identifier_name(&binary.right)?;
+        return Some((name, without_parentheses(&binary.right)));
+    }
+
+    None
 }
 
 fn assignment_null_check<'a, 'b>(
@@ -464,6 +558,37 @@ var _foo;
 ",
             "
 foo?.bar(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_logical_or_member_access() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo;
+(_foo = foo) === null || _foo === void 0 || _foo.bar;
+
+foo === null || foo === void 0 || foo.baz;
+",
+            "
+foo?.bar;
+foo?.baz;
+",
+        );
+    }
+
+    #[test]
+    fn restores_logical_or_calls() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo, _bar;
+(_foo = foo) === null || _foo === void 0 || _foo(bar);
+(_bar = foo.bar) === null || _bar === void 0 || _bar.call(foo, baz);
+",
+            "
+foo?.(bar);
+foo.bar?.(baz);
 ",
         );
     }
