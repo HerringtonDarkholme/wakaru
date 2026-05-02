@@ -233,7 +233,7 @@ This list records the audited migration order for the default `packages/unminify
 | 35 | `un-default-parameter` | partial | First AST slice restores body-start loose defaults like `if (x === undefined) x = value` and common Babel `arguments[n]` ternaries into positional/default formal parameters. Remaining gaps: logical-only default forms, broader scope/reference safety, exact TS generated-name parity, rest interaction, and full statement-container parity. |
 | 36 | `un-parameter-rest` | partial | First semantic slice converts parameterless non-arrow functions that use implicit `arguments` into `...args`, including references from nested arrows, while skipping parent/current/child `args` conflicts. Remaining gaps: exact upstream scope edge parity and broader generated rest-loop recognition. |
 | 37 | `un-parameters` | partial | Public composite registry entry is wired and currently runs the ported `un-default-parameter` and `un-parameter-rest` slices in TS order. |
-| 38 | `un-argument-spread` | `AST mutate` | Convert safe `.apply` calls to spread arguments. |
+| 38 | `un-argument-spread` | done | AST mutate pass converting safe `fn.apply(undefined/null, args)` and receiver-matched `obj.fn.apply(obj, args)` / computed-member variants to spread calls; wired. |
 | 39 | `un-jsx` | `Semantic transform` | Convert React classic and automatic runtime calls to JSX. |
 | 40 | `un-es6-class` | `Semantic transform` | Rebuild classes from constructor/prototype/static/getter/setter/extends shapes. |
 | 41 | `un-async-await` | `Semantic transform` | Reconstruct TypeScript `__generator` and `__awaiter`; control-flow heavy, migrate last. |
