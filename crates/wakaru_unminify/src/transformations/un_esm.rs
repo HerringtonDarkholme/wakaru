@@ -11,7 +11,7 @@ use oxc_ast::{
     AstBuilder,
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::AssignmentOperator;
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::{ParsedSourceFile, SyntheticTrailingComment};
@@ -24,8 +24,10 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     interop_require_default::transform_ast(source)?;
     interop_require_wildcard::transform_ast(source)?;
 
+    let namespace_hints =
+        NamespaceImportHints::new(&source.source.code, &source.synthetic_trailing_comments);
     let ast = AstBuilder::new(source.allocator);
-    let mut transformer = CommonJsImportTransformer::new(ast);
+    let mut transformer = CommonJsImportTransformer::new(ast, namespace_hints);
     transformer.transform_program(&mut source.program);
 
     let mut dynamic_import_transformer = DynamicRequireTransformer {
@@ -385,27 +387,38 @@ impl<'a> CommonJsExportTransformer<'a> {
 struct CommonJsImportTransformer<'a> {
     ast: AstBuilder<'a>,
     imports: ImportManager,
+    namespace_hints: NamespaceImportHints,
+    namespace_aliases: HashMap<String, NamespaceAlias>,
 }
 
 impl<'a> CommonJsImportTransformer<'a> {
-    fn new(ast: AstBuilder<'a>) -> Self {
+    fn new(ast: AstBuilder<'a>, namespace_hints: NamespaceImportHints) -> Self {
         Self {
             ast,
             imports: ImportManager::default(),
+            namespace_hints,
+            namespace_aliases: HashMap::new(),
         }
     }
 
     fn transform_program(&mut self, program: &mut Program<'a>) {
+        self.namespace_aliases = self.collect_namespace_aliases(&program.body);
+        let rename_map = self.namespace_rename_map();
+
         let old_body = program.body.take_in(self.ast);
         let mut kept_body = self.ast.vec_with_capacity(old_body.len());
 
         for statement in old_body {
             match statement {
                 Statement::ImportDeclaration(import) => {
-                    self.imports.collect_import(&import);
+                    self.collect_import_declaration(&import);
                 }
                 Statement::ExpressionStatement(statement)
+                    if self.collect_namespace_assignment(&statement.expression) => {}
+                Statement::ExpressionStatement(statement)
                     if self.collect_bare_require(&statement.expression) => {}
+                Statement::VariableDeclaration(declaration)
+                    if self.collect_namespace_declaration(&declaration) => {}
                 Statement::VariableDeclaration(declaration)
                     if self.collect_variable_require(&declaration) => {}
                 statement => kept_body.push(statement),
@@ -419,6 +432,160 @@ impl<'a> CommonJsImportTransformer<'a> {
         self.imports.push_import_statements(self.ast, &mut new_body);
         new_body.extend(kept_body);
         program.body = new_body;
+
+        if !rename_map.is_empty() {
+            let mut renamer = NamespaceAliasRenamer {
+                ast: self.ast,
+                rename_map: &rename_map,
+            };
+            renamer.visit_program(program);
+        }
+    }
+
+    fn collect_import_declaration(&mut self, import: &ImportDeclaration) {
+        let source = import.source.value.as_str();
+        let Some(specifiers) = &import.specifiers else {
+            self.imports.add_bare(source);
+            return;
+        };
+
+        for specifier in specifiers {
+            match specifier {
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
+                    let local = default.local.name.as_str();
+                    if let Some(namespace) = self.namespace_aliases.get(local) {
+                        self.imports.add_namespace(source, &namespace.alias);
+                    } else {
+                        self.imports.add_default(source, local);
+                    }
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
+                    self.imports
+                        .add_namespace(source, namespace.local.name.as_str());
+                }
+                ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                    let Some(imported) = imported_name(&named.imported) else {
+                        continue;
+                    };
+                    self.imports
+                        .add_named(source, imported, named.local.name.as_str());
+                }
+            }
+        }
+    }
+
+    fn collect_namespace_aliases(
+        &self,
+        body: &oxc_allocator::Vec<'a, Statement<'a>>,
+    ) -> HashMap<String, NamespaceAlias> {
+        let mut source_by_local = HashSet::new();
+
+        for statement in body {
+            match statement {
+                Statement::ImportDeclaration(import) => {
+                    let Some(specifiers) = &import.specifiers else {
+                        continue;
+                    };
+                    for specifier in specifiers {
+                        if let ImportDeclarationSpecifier::ImportDefaultSpecifier(default) =
+                            specifier
+                        {
+                            source_by_local.insert(default.local.name.as_str().to_string());
+                        }
+                    }
+                }
+                Statement::VariableDeclaration(declaration) => {
+                    let Some((local, _source)) = basic_require_binding(declaration) else {
+                        continue;
+                    };
+                    source_by_local.insert(local);
+                }
+                _ => {}
+            }
+        }
+
+        let mut aliases = HashMap::new();
+        for statement in body {
+            match statement {
+                Statement::VariableDeclaration(declaration) => {
+                    if let Some((local, _source)) = basic_require_binding(declaration) {
+                        if self
+                            .namespace_hints
+                            .has_variable_declaration_hint(declaration)
+                        {
+                            aliases.insert(local.clone(), NamespaceAlias { alias: local });
+                        }
+                        continue;
+                    }
+
+                    if let Some((alias, source_local)) = variable_alias_binding(declaration) {
+                        if !self
+                            .namespace_hints
+                            .has_variable_declaration_hint(declaration)
+                        {
+                            continue;
+                        }
+                        if source_by_local.contains(&source_local) {
+                            aliases.insert(source_local, NamespaceAlias { alias });
+                        }
+                    }
+                }
+                Statement::ExpressionStatement(statement) => {
+                    let Some((alias, source_local)) =
+                        expression_assignment_alias(&statement.expression)
+                    else {
+                        continue;
+                    };
+                    if !self
+                        .namespace_hints
+                        .has_assignment_hint(&statement.expression)
+                    {
+                        continue;
+                    }
+                    if source_by_local.contains(&source_local) {
+                        aliases.insert(source_local, NamespaceAlias { alias });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        aliases
+    }
+
+    fn namespace_rename_map(&self) -> HashMap<String, String> {
+        self.namespace_aliases
+            .iter()
+            .filter_map(|(local, namespace)| {
+                (local != &namespace.alias).then(|| (local.clone(), namespace.alias.clone()))
+            })
+            .collect()
+    }
+
+    fn collect_namespace_declaration(&mut self, declaration: &VariableDeclaration<'a>) -> bool {
+        if let Some((local, source)) = basic_require_binding(declaration) {
+            if let Some(namespace) = self.namespace_aliases.get(&local) {
+                self.imports.add_namespace(&source, &namespace.alias);
+                return true;
+            }
+            return false;
+        }
+
+        let Some((alias, source_local)) = variable_alias_binding(declaration) else {
+            return false;
+        };
+        self.namespace_aliases
+            .get(&source_local)
+            .is_some_and(|namespace| namespace.alias == alias)
+    }
+
+    fn collect_namespace_assignment(&mut self, expression: &Expression<'a>) -> bool {
+        let Some((alias, source_local)) = expression_assignment_alias(expression) else {
+            return false;
+        };
+        self.namespace_aliases
+            .get(&source_local)
+            .is_some_and(|namespace| namespace.alias == alias)
     }
 
     fn collect_bare_require(&mut self, expression: &Expression<'a>) -> bool {
@@ -528,6 +695,61 @@ impl<'a> CommonJsImportTransformer<'a> {
     }
 }
 
+struct NamespaceAlias {
+    alias: String,
+}
+
+struct NamespaceAliasRenamer<'a, 'm> {
+    ast: AstBuilder<'a>,
+    rename_map: &'m HashMap<String, String>,
+}
+
+impl<'a> VisitMut<'a> for NamespaceAliasRenamer<'a, '_> {
+    fn visit_identifier_reference(
+        &mut self,
+        identifier: &mut oxc_ast::ast::IdentifierReference<'a>,
+    ) {
+        if let Some(new_name) = self.rename_map.get(identifier.name.as_str()) {
+            identifier.name = self.ast.ident(new_name);
+        }
+    }
+}
+
+struct NamespaceImportHints {
+    source_code: String,
+    candidates: HashSet<String>,
+}
+
+impl NamespaceImportHints {
+    fn new(source_code: &str, comments: &[SyntheticTrailingComment]) -> Self {
+        let candidates = comments
+            .iter()
+            .filter(|comment| comment.replacement.contains("@hint namespace-import"))
+            .flat_map(|comment| comment.candidates.iter().cloned())
+            .collect();
+
+        Self {
+            source_code: source_code.to_string(),
+            candidates,
+        }
+    }
+
+    fn has_variable_declaration_hint(&self, declaration: &VariableDeclaration) -> bool {
+        let Some(candidate) = variable_declaration_hint_candidate(declaration, &self.source_code)
+        else {
+            return false;
+        };
+        self.candidates.contains(&candidate)
+    }
+
+    fn has_assignment_hint(&self, expression: &Expression) -> bool {
+        let Some(candidate) = assignment_hint_candidate(expression, &self.source_code) else {
+            return false;
+        };
+        self.candidates.contains(&candidate)
+    }
+}
+
 struct DynamicRequireTransformer<'a> {
     ast: AstBuilder<'a>,
 }
@@ -572,31 +794,6 @@ struct NamedImport {
 }
 
 impl ImportManager {
-    fn collect_import(&mut self, import: &ImportDeclaration) {
-        let source = import.source.value.as_str();
-        let Some(specifiers) = &import.specifiers else {
-            self.add_bare(source);
-            return;
-        };
-
-        for specifier in specifiers {
-            match specifier {
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
-                    self.add_default(source, default.local.name.as_str());
-                }
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
-                    self.add_namespace(source, namespace.local.name.as_str());
-                }
-                ImportDeclarationSpecifier::ImportSpecifier(named) => {
-                    let Some(imported) = imported_name(&named.imported) else {
-                        continue;
-                    };
-                    self.add_named(source, imported, named.local.name.as_str());
-                }
-            }
-        }
-    }
-
     fn add_bare(&mut self, source: &str) {
         self.bucket_mut(source).bare = true;
     }
@@ -875,6 +1072,104 @@ fn imported_name<'a>(imported: &'a ModuleExportName<'a>) -> Option<&'a str> {
         ModuleExportName::IdentifierName(identifier) => Some(identifier.name.as_str()),
         ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
         ModuleExportName::StringLiteral(_) => None,
+    }
+}
+
+fn basic_require_binding(declaration: &VariableDeclaration) -> Option<(String, String)> {
+    if declaration.declarations.len() != 1 {
+        return None;
+    }
+
+    let declarator = &declaration.declarations[0];
+    let local = binding_identifier_name(&declarator.id)?.to_string();
+    let source = require_call_source(declarator.init.as_ref()?)?.to_string();
+    Some((local, source))
+}
+
+fn variable_alias_binding(declaration: &VariableDeclaration) -> Option<(String, String)> {
+    if declaration.declarations.len() != 1 {
+        return None;
+    }
+
+    let declarator = &declaration.declarations[0];
+    let alias = binding_identifier_name(&declarator.id)?.to_string();
+    let source_local = expression_identifier_name(declarator.init.as_ref()?)?.to_string();
+    Some((alias, source_local))
+}
+
+fn expression_assignment_alias(expression: &Expression) -> Option<(String, String)> {
+    let Expression::AssignmentExpression(assignment) = expression else {
+        return None;
+    };
+    if assignment.operator != AssignmentOperator::Assign {
+        return None;
+    }
+
+    let alias = assignment_target_identifier_name(&assignment.left)?.to_string();
+    let source_local = expression_identifier_name(&assignment.right)?.to_string();
+    Some((alias, source_local))
+}
+
+fn variable_declaration_hint_candidate(
+    declaration: &VariableDeclaration,
+    source_code: &str,
+) -> Option<String> {
+    if declaration.declarations.len() != 1 {
+        return None;
+    }
+
+    let declarator = &declaration.declarations[0];
+    let local = binding_identifier_name(&declarator.id)?;
+    let init = expression_source(declarator.init.as_ref()?, source_code)?;
+    Some(format!(
+        "{} {local} = {init}",
+        variable_declaration_kind_text(declaration.kind)
+    ))
+}
+
+fn assignment_hint_candidate(expression: &Expression, source_code: &str) -> Option<String> {
+    let Expression::AssignmentExpression(assignment) = expression else {
+        return None;
+    };
+    if assignment.operator != AssignmentOperator::Assign {
+        return None;
+    }
+
+    let left = assignment_target_source(&assignment.left, source_code)?;
+    let right = expression_source(&assignment.right, source_code)?;
+    Some(format!("{left} = {right}"))
+}
+
+fn assignment_target_identifier_name<'b, 'a>(target: &'b AssignmentTarget<'a>) -> Option<&'b str> {
+    let AssignmentTarget::AssignmentTargetIdentifier(identifier) = target else {
+        return None;
+    };
+    Some(identifier.name.as_str())
+}
+
+fn assignment_target_source(target: &AssignmentTarget, source_code: &str) -> Option<String> {
+    source_code
+        .get(target.span().start as usize..target.span().end as usize)
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+}
+
+fn expression_source(expression: &Expression, source_code: &str) -> Option<String> {
+    source_code
+        .get(expression.span().start as usize..expression.span().end as usize)
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+}
+
+fn variable_declaration_kind_text(kind: VariableDeclarationKind) -> &'static str {
+    match kind {
+        VariableDeclarationKind::Var => "var",
+        VariableDeclarationKind::Let => "let",
+        VariableDeclarationKind::Const => "const",
+        VariableDeclarationKind::Using => "using",
+        VariableDeclarationKind::AwaitUsing => "await using",
     }
 }
 
@@ -1232,6 +1527,61 @@ _foo.default();
             "
 import _foo from \"foo\";
 _foo();
+",
+        );
+    }
+
+    #[test]
+    fn restores_namespace_import_from_interop_wildcard_require() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _interopRequireWildcard = require(\"@babel/runtime/helpers/interopRequireWildcard\");
+var _baz = _interopRequireWildcard(require(\"baz\"));
+",
+            "
+import * as _baz from \"baz\";
+",
+        );
+    }
+
+    #[test]
+    fn restores_namespace_import_from_interop_wildcard_alias_assignment() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _interopRequireWildcard = require(\"@babel/runtime/helpers/interopRequireWildcard\");
+
+var _foo = require(\"foo\");
+_foo = _interopRequireWildcard(_foo);
+
+var _bar = require(\"bar\");
+_source = _interopRequireWildcard(_bar);
+",
+            "
+import * as _foo from \"foo\";
+import * as _source from \"bar\";
+",
+        );
+    }
+
+    #[test]
+    fn restores_namespace_import_from_existing_default_import() {
+        define_ast_inline_test(transform_ast)(
+            "
+import _source$es6Default from \"source\";
+import _another$es6Default from \"another\";
+
+var _interopRequireWildcard = require(\"@babel/runtime/helpers/interopRequireWildcard\");
+var _source = _interopRequireWildcard(_source$es6Default);
+_source;
+
+var _another = _interopRequireWildcard(_another$es6Default);
+_another$es6Default;
+",
+            "
+import * as _source from \"source\";
+import * as _another from \"another\";
+_source;
+_another;
 ",
         );
     }
