@@ -284,8 +284,11 @@ fn strict_undefined_check<'a>(expression: &'a Expression<'a>) -> Option<&'a str>
     match (
         identifier_name(&binary.left),
         is_undefined_expression(&binary.right),
+        is_undefined_expression(&binary.left),
+        identifier_name(&binary.right),
     ) {
-        (Some(name), true) => Some(name),
+        (Some(name), true, _, _) => Some(name),
+        (_, _, true, Some(name)) => Some(name),
         _ => None,
     }
 }
@@ -686,6 +689,85 @@ function add2(a = 2, b) {
     }
 
     #[test]
+    fn restores_reversed_loose_default_parameters() {
+        define_ast_inline_test(transform_ast)(
+            "
+function test(x, y) {
+  if (void 0 === x) x = 1;
+  if (undefined === y) {
+    y = 2;
+  }
+  console.log(x, y);
+}
+",
+            "
+function test(x = 1, y = 2) {
+  console.log(x, y);
+}
+",
+        );
+    }
+
+    #[test]
+    fn restores_function_expression_and_arrow_defaults() {
+        define_ast_inline_test(transform_ast)(
+            "
+const arrow = (a, b) => {
+  if (a === void 0) a = 1;
+  if (void 0 === b) b = 2;
+};
+var func = function(e) {
+  var f = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 5;
+  return e + f;
+};
+",
+            "
+const arrow = (a = 1, b = 2) => {};
+var func = function(e, f = 5) {
+  return e + f;
+};
+",
+        );
+    }
+
+    #[test]
+    fn restores_method_defaults() {
+        define_ast_inline_test(transform_ast)(
+            "
+const object = {
+  foo(a, b) {
+    if (a === void 0) a = 1;
+    if (void 0 === b) b = 2;
+  },
+  set field(num) {
+    if (num === void 0) {
+      num = 1;
+    }
+    this.num = num;
+  }
+};
+class Test {
+  foo(a, b) {
+    if (a === void 0) a = 1;
+    if (void 0 === b) b = 2;
+  }
+}
+",
+            "
+const object = {
+  foo(a = 1, b = 2) {},
+  set field(num = 1) {
+    this.num = num;
+  }
+};
+class Test {
+  foo(a = 1, b = 2) {}
+}
+",
+        );
+    }
+
+    #[test]
     fn keeps_existing_parameters_at_mismatched_argument_indices() {
         define_ast_inline_test(transform_ast)(
             r#"
@@ -739,6 +821,25 @@ function test(a, _param_1, _param_2_1, _param_3, e = world()) {
   return e;
 }
 ",
+        );
+    }
+
+    #[test]
+    fn fills_multiple_parameter_gaps_with_ts_parity_names() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+function test(a) {
+  var b = arguments.length > 1 ? arguments[1] : undefined;
+  var e = arguments.length > 4 && undefined !== arguments[4] ? arguments[4] : world();
+  var z = arguments.length > 6 && arguments[6] !== undefined ? arguments[6] : "hello";
+  var _param_3 = 1;
+}
+"#,
+            r#"
+function test(a, b, _param_2, _param_3_1, e = world(), _param_5, z = "hello") {
+  var _param_3 = 1;
+}
+"#,
         );
     }
 
