@@ -56,7 +56,8 @@ impl<'a> OptionalChainingTransformer<'a> {
             return None;
         };
 
-        let guard = optional_member_guard(conditional)?;
+        let guard =
+            optional_member_guard(conditional).or_else(|| optional_delete_guard(conditional))?;
         let replacement = self.optional_chain_expression(
             conditional.span,
             guard.target,
@@ -105,30 +106,79 @@ impl<'a> OptionalChainingTransformer<'a> {
         member: &Expression<'a>,
     ) -> Option<Expression<'a>> {
         let expression = match without_parentheses(member) {
-            Expression::StaticMemberExpression(member) => {
-                Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
-                    member.span,
-                    object.clone_in(self.ast.allocator),
-                    member.property.clone_in(self.ast.allocator),
-                    true,
-                ))
-            }
-            Expression::ComputedMemberExpression(member) => {
-                Expression::ComputedMemberExpression(self.ast.alloc_computed_member_expression(
-                    member.span,
-                    object.clone_in(self.ast.allocator),
-                    member.expression.clone_in(self.ast.allocator),
-                    true,
-                ))
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
+                self.optional_member_access(object, temp_name, member)?
             }
             Expression::CallExpression(call) => {
                 return self.optional_call_expression(span, object, temp_name, call);
+            }
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Delete => {
+                let argument = self.optional_chain_expression(
+                    unary.span,
+                    object,
+                    temp_name,
+                    without_parentheses(&unary.argument),
+                )?;
+                return Some(self.ast.expression_unary(
+                    unary.span,
+                    UnaryOperator::Delete,
+                    argument,
+                ));
             }
             _ => return None,
         };
 
         let chain_element = expression.into_chain_element()?;
         Some(self.ast.expression_chain(span, chain_element))
+    }
+
+    fn optional_member_access(
+        &self,
+        target: &Expression<'a>,
+        temp_name: &str,
+        member: &Expression<'a>,
+    ) -> Option<Expression<'a>> {
+        match without_parentheses(member) {
+            Expression::StaticMemberExpression(member) => {
+                let (object, optional) =
+                    self.optional_member_object(target, temp_name, &member.object)?;
+                Some(Expression::StaticMemberExpression(
+                    self.ast.alloc_static_member_expression(
+                        member.span,
+                        object,
+                        member.property.clone_in(self.ast.allocator),
+                        optional,
+                    ),
+                ))
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let (object, optional) =
+                    self.optional_member_object(target, temp_name, &member.object)?;
+                Some(Expression::ComputedMemberExpression(
+                    self.ast.alloc_computed_member_expression(
+                        member.span,
+                        object,
+                        member.expression.clone_in(self.ast.allocator),
+                        optional,
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn optional_member_object(
+        &self,
+        target: &Expression<'a>,
+        temp_name: &str,
+        object: &Expression<'a>,
+    ) -> Option<(Expression<'a>, bool)> {
+        if identifier_name(object) == Some(temp_name) || expressions_match(object, target) {
+            return Some((target.clone_in(self.ast.allocator), true));
+        }
+
+        let object = self.optional_member_access(target, temp_name, object)?;
+        Some((object, false))
     }
 
     fn optional_call_expression(
@@ -436,6 +486,50 @@ fn optional_member_guard<'a, 'b>(
     conditional: &'b ConditionalExpression<'a>,
 ) -> Option<OptionalOrGuard<'a, 'b>> {
     if !is_undefined_expression(without_parentheses(&conditional.consequent)) {
+        return None;
+    }
+
+    let Expression::LogicalExpression(logical) = without_parentheses(&conditional.test) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::Or {
+        return None;
+    }
+
+    if let Some((temp_name, target)) = assignment_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: Some(temp_name),
+            });
+        }
+    }
+
+    if let Some((temp_name, target)) = identifier_null_check(without_parentheses(&logical.left)) {
+        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn optional_delete_guard<'a, 'b>(
+    conditional: &'b ConditionalExpression<'a>,
+) -> Option<OptionalOrGuard<'a, 'b>> {
+    if !is_true_expression(without_parentheses(&conditional.consequent)) {
+        return None;
+    }
+
+    let Expression::UnaryExpression(unary) = without_parentheses(&conditional.alternate) else {
+        return None;
+    };
+    if unary.operator != UnaryOperator::Delete {
         return None;
     }
 
@@ -815,6 +909,13 @@ fn is_undefined_expression(expression: &Expression) -> bool {
     }
 }
 
+fn is_true_expression(expression: &Expression) -> bool {
+    matches!(
+        without_parentheses(expression),
+        Expression::BooleanLiteral(literal) if literal.value
+    )
+}
+
 fn is_numeric_zero(expression: &Expression) -> bool {
     match without_parentheses(expression) {
         Expression::NumericLiteral(literal) => literal.value == 0.0,
@@ -949,6 +1050,25 @@ foo?.bar;
 foo?.bar;
 foo?.(baz);
 foo.bar?.(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_delete_optional_chaining() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _obj, _foo;
+obj === null || obj === void 0 || delete obj.a;
+obj === null || obj === void 0 || delete obj.a.b;
+(_obj = obj) === null || _obj === void 0 ? true : delete _obj.a;
+(_foo = foo) === null || _foo === void 0 ? true : delete _foo.bar();
+",
+            "
+delete obj?.a;
+delete obj?.a.b;
+delete obj?.a;
+delete foo?.bar();
 ",
         );
     }
