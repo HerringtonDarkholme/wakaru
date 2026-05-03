@@ -574,6 +574,30 @@ function foo4() {
     }
 
     #[test]
+    fn restores_nullish_coalescing_in_nested_statement_containers() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _b;
+var _c = {}.qux, qux = _c === void 0 ? (_b = foo.bar) !== null && _b !== void 0 ? _b : \"qux\" : _c;
+function foo(foo, qux) {
+  var _a;
+  if (qux === void 0) {
+    qux = (_a = foo.bar) !== null && _a !== void 0 ? _a : \"qux\";
+  }
+}
+",
+            "
+var _c = {}.qux, qux = _c === void 0 ? foo.bar ?? \"qux\" : _c;
+function foo(foo, qux) {
+  if (qux === void 0) {
+    qux = foo.bar ?? \"qux\";
+  }
+}
+",
+        );
+    }
+
+    #[test]
     fn leaves_mismatched_guards_unchanged() {
         define_ast_inline_test(transform_ast)(
             "
