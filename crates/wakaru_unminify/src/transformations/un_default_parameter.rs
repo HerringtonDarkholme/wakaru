@@ -123,8 +123,8 @@ impl<'a> DefaultParameterTransformer<'a> {
 
         match init {
             ArgumentsParameterInit::Normal { index } => {
-                if existing_param(params, name) {
-                    return true;
+                if let Some(existing_index) = existing_param_index(params, name) {
+                    return existing_index == index;
                 }
 
                 self.insert_parameter_at(params, index, name, None, used_names);
@@ -135,7 +135,14 @@ impl<'a> DefaultParameterTransformer<'a> {
                 default_value,
             } => {
                 let init = default_value.clone_in(self.ast.allocator);
-                if let Some(parameter) = existing_param_mut(params, name) {
+                if let Some(existing_index) = existing_param_index(params, name) {
+                    if existing_index != index {
+                        return false;
+                    }
+                    let parameter = params
+                        .items
+                        .get_mut(existing_index)
+                        .expect("existing parameter index should be valid");
                     parameter.initializer = Some(Box::new_in(init, self.ast.allocator));
                 } else {
                     self.insert_parameter_at(params, index, name, Some(init), used_names);
@@ -145,7 +152,14 @@ impl<'a> DefaultParameterTransformer<'a> {
             }
             ArgumentsParameterInit::DefaultBoolean { index, value } => {
                 let init = self.ast.expression_boolean_literal(Span::default(), value);
-                if let Some(parameter) = existing_param_mut(params, name) {
+                if let Some(existing_index) = existing_param_index(params, name) {
+                    if existing_index != index {
+                        return false;
+                    }
+                    let parameter = params
+                        .items
+                        .get_mut(existing_index)
+                        .expect("existing parameter index should be valid");
                     parameter.initializer = Some(Box::new_in(init, self.ast.allocator));
                 } else {
                     self.insert_parameter_at(params, index, name, Some(init), used_names);
@@ -540,11 +554,11 @@ fn without_parentheses<'a, 'b>(expression: &'b Expression<'a>) -> &'b Expression
     }
 }
 
-fn existing_param(params: &FormalParameters, name: &str) -> bool {
+fn existing_param_index(params: &FormalParameters, name: &str) -> Option<usize> {
     params
         .items
         .iter()
-        .any(|parameter| parameter_identifier_name(parameter) == Some(name))
+        .position(|parameter| parameter_identifier_name(parameter) == Some(name))
 }
 
 fn existing_param_mut<'a, 'b>(
@@ -665,6 +679,26 @@ function add2() {
 "#,
             r#"
 function add2(a = 2, b) {
+  return a + b;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn keeps_existing_parameters_at_mismatched_argument_indices() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+function test(a, b) {
+  var b = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 2;
+  var a = arguments.length > 1 ? arguments[1] : undefined;
+  return a + b;
+}
+"#,
+            r#"
+function test(a, b) {
+  var b = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 2;
+  var a = arguments.length > 1 ? arguments[1] : undefined;
   return a + b;
 }
 "#,
