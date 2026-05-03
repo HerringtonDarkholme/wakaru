@@ -246,6 +246,11 @@ impl<'a> OptionalChainingTransformer<'a> {
             Expression::Identifier(identifier) if identifier.name == temp_name => {
                 self.optional_call(span, target.clone_in(self.ast.allocator), call, 0, true)
             }
+            Expression::SequenceExpression(sequence)
+                if is_indirect_call_sequence(sequence, temp_name) =>
+            {
+                self.optional_indirect_call(span, target, sequence, call)
+            }
             Expression::StaticMemberExpression(member)
                 if identifier_name(&member.object) == Some(temp_name) =>
             {
@@ -299,6 +304,21 @@ impl<'a> OptionalChainingTransformer<'a> {
             }
             _ => None,
         }
+    }
+
+    fn optional_indirect_call(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        sequence: &oxc_ast::ast::SequenceExpression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let mut expressions = self.ast.vec_with_capacity(2);
+        expressions.push(sequence.expressions[0].clone_in(self.ast.allocator));
+        expressions.push(target.clone_in(self.ast.allocator));
+        let callee = self.ast.expression_sequence(sequence.span, expressions);
+
+        self.optional_call(span, callee, call, 0, true)
     }
 
     fn optional_call_method(
@@ -964,6 +984,12 @@ fn argument_matches_identifier(argument: &Argument, name: &str) -> bool {
     identifier.name == name
 }
 
+fn is_indirect_call_sequence(sequence: &oxc_ast::ast::SequenceExpression, temp_name: &str) -> bool {
+    sequence.expressions.len() == 2
+        && is_numeric_zero(&sequence.expressions[0])
+        && identifier_name(&sequence.expressions[1]) == Some(temp_name)
+}
+
 fn expressions_match(left: &Expression, right: &Expression) -> bool {
     match (without_parentheses(left), without_parentheses(right)) {
         (Expression::Identifier(left), Expression::Identifier(right)) => left.name == right.name,
@@ -1247,6 +1273,21 @@ var _foo_bar;
 ",
             "
 foo.bar?.(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_indirect_optional_calls() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _eval;
+eval === null || eval === void 0 || (0, eval)(foo);
+(_eval = eval()) === null || _eval === void 0 ? void 0 : (0, _eval)(foo);
+",
+            "
+(0, eval)?.(foo);
+(0, eval())?.(foo);
 ",
         );
     }
