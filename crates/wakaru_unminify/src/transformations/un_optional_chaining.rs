@@ -243,19 +243,26 @@ impl<'a> OptionalChainingTransformer<'a> {
         call: &CallExpression<'a>,
     ) -> Option<Expression<'a>> {
         match without_parentheses(&call.callee) {
-            Expression::Identifier(identifier) if identifier.name == temp_name => {
-                self.optional_call(span, target.clone_in(self.ast.allocator), call, 0, true)
-            }
+            Expression::Identifier(identifier) if identifier.name == temp_name => self
+                .optional_call(
+                    span,
+                    target.clone_in(self.ast.allocator),
+                    call,
+                    0,
+                    true,
+                    target,
+                    temp_name,
+                ),
             Expression::SequenceExpression(sequence)
                 if is_indirect_call_sequence(sequence, temp_name) =>
             {
-                self.optional_indirect_call(span, target, sequence, call)
+                self.optional_indirect_call(span, target, temp_name, sequence, call)
             }
             Expression::StaticMemberExpression(member)
                 if identifier_name(&member.object) == Some(temp_name) =>
             {
                 if member.property.name == "call" {
-                    return self.optional_call_method(span, target, call);
+                    return self.optional_call_method(span, target, temp_name, call);
                 }
 
                 if member.property.name == "apply" {
@@ -277,7 +284,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         member.property.clone_in(self.ast.allocator),
                         true,
                     ));
-                self.optional_call(span, callee, call, 0, false)
+                self.optional_call(span, callee, call, 0, false, target, temp_name)
             }
             Expression::ComputedMemberExpression(member)
                 if identifier_name(&member.object) == Some(temp_name) =>
@@ -290,7 +297,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         true,
                     ),
                 );
-                self.optional_call(span, callee, call, 0, false)
+                self.optional_call(span, callee, call, 0, false, target, temp_name)
             }
             Expression::StaticMemberExpression(apply_member)
                 if apply_member.property.name == "apply" =>
@@ -302,6 +309,12 @@ impl<'a> OptionalChainingTransformer<'a> {
             {
                 self.optional_bind_member_expression(span, target, temp_name, bind_member, call)
             }
+            Expression::StaticMemberExpression(member) => {
+                self.optional_static_member_call(span, target, temp_name, member, call)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                self.optional_computed_member_call(span, target, temp_name, member, call)
+            }
             _ => None,
         }
     }
@@ -310,6 +323,7 @@ impl<'a> OptionalChainingTransformer<'a> {
         &self,
         span: Span,
         target: &Expression<'a>,
+        temp_name: &str,
         sequence: &oxc_ast::ast::SequenceExpression<'a>,
         call: &CallExpression<'a>,
     ) -> Option<Expression<'a>> {
@@ -318,13 +332,53 @@ impl<'a> OptionalChainingTransformer<'a> {
         expressions.push(target.clone_in(self.ast.allocator));
         let callee = self.ast.expression_sequence(sequence.span, expressions);
 
-        self.optional_call(span, callee, call, 0, true)
+        self.optional_call(span, callee, call, 0, true, target, temp_name)
+    }
+
+    fn optional_static_member_call(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let (object, optional) = self.optional_member_object(target, temp_name, &member.object)?;
+        let callee = Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
+            member.span,
+            object,
+            member.property.clone_in(self.ast.allocator),
+            optional || member.optional,
+        ));
+
+        self.optional_call(span, callee, call, 0, false, target, temp_name)
+    }
+
+    fn optional_computed_member_call(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        call: &CallExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let (object, optional) = self.optional_member_object(target, temp_name, &member.object)?;
+        let callee =
+            Expression::ComputedMemberExpression(self.ast.alloc_computed_member_expression(
+                member.span,
+                object,
+                member.expression.clone_in(self.ast.allocator),
+                optional || member.optional,
+            ));
+
+        self.optional_call(span, callee, call, 0, false, target, temp_name)
     }
 
     fn optional_call_method(
         &self,
         span: Span,
         target: &Expression<'a>,
+        temp_name: &str,
         call: &CallExpression<'a>,
     ) -> Option<Expression<'a>> {
         let first_argument = call.arguments.first()?;
@@ -333,7 +387,15 @@ impl<'a> OptionalChainingTransformer<'a> {
             return None;
         }
 
-        self.optional_call(span, target.clone_in(self.ast.allocator), call, 1, true)
+        self.optional_call(
+            span,
+            target.clone_in(self.ast.allocator),
+            call,
+            1,
+            true,
+            target,
+            temp_name,
+        )
     }
 
     fn optional_apply_member_call(
@@ -485,12 +547,14 @@ impl<'a> OptionalChainingTransformer<'a> {
         call: &CallExpression<'a>,
         skip_arguments: usize,
         optional: bool,
+        target: &Expression<'a>,
+        temp_name: &str,
     ) -> Option<Expression<'a>> {
         let mut arguments = self
             .ast
             .vec_with_capacity(call.arguments.len().saturating_sub(skip_arguments));
         for argument in call.arguments.iter().skip(skip_arguments) {
-            arguments.push(argument.clone_in(self.ast.allocator));
+            arguments.push(self.optional_call_argument(span, target, temp_name, argument));
         }
 
         let expression = Expression::CallExpression(self.ast.alloc_call_expression_with_pure(
@@ -498,11 +562,27 @@ impl<'a> OptionalChainingTransformer<'a> {
             callee,
             call.type_arguments.clone_in(self.ast.allocator),
             arguments,
-            optional,
+            optional || call.optional,
             call.pure,
         ));
         let chain_element = expression.into_chain_element()?;
         Some(self.ast.expression_chain(span, chain_element))
+    }
+
+    fn optional_call_argument(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        argument: &Argument<'a>,
+    ) -> Argument<'a> {
+        let Some(expression) = argument.as_expression() else {
+            return argument.clone_in(self.ast.allocator);
+        };
+
+        self.optional_chain_expression(span, target, temp_name, expression)
+            .map(Argument::from)
+            .unwrap_or_else(|| argument.clone_in(self.ast.allocator))
     }
 
     fn remove_unused_temp_declarations(
@@ -1288,6 +1368,29 @@ eval === null || eval === void 0 || (0, eval)(foo);
             "
 (0, eval)?.(foo);
 (0, eval())?.(foo);
+",
+        );
+    }
+
+    #[test]
+    fn restores_memoized_optional_call_arguments() {
+        define_ast_inline_test(transform_ast)(
+            "
+function test(foo) {
+  var _foo$bar, _foo$bar2, _foo$bar3, _foo$bar4;
+  (_foo$bar = foo.bar) === null || _foo$bar === void 0 || _foo$bar.call(foo, foo.bar, false);
+  foo === null || foo === void 0 || (_foo$bar2 = foo.bar) === null || _foo$bar2 === void 0 || _foo$bar2.call(foo, foo.bar, true);
+  (_foo$bar3 = foo.bar) === null || _foo$bar3 === void 0 || _foo$bar3.baz(foo.bar, false);
+  foo === null || foo === void 0 || (_foo$bar4 = foo.bar) === null || _foo$bar4 === void 0 || _foo$bar4.baz(foo.bar, true);
+}
+",
+            "
+function test(foo) {
+  foo.bar?.(foo.bar, false);
+  foo?.bar?.(foo?.bar, true);
+  foo.bar?.baz(foo.bar, false);
+  foo?.bar?.baz(foo?.bar, true);
+}
 ",
         );
     }
