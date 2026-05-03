@@ -24,6 +24,19 @@ struct ConditionalRenderer<'a> {
 }
 
 impl<'a> VisitMut<'a> for ConditionalRenderer<'a> {
+    fn visit_statement(&mut self, statement: &mut Statement<'a>) {
+        walk_mut::walk_statement(self, statement);
+
+        let Statement::IfStatement(if_statement) = statement else {
+            return;
+        };
+
+        self.render_if_branch(&mut if_statement.consequent);
+        if let Some(alternate) = &mut if_statement.alternate {
+            self.render_if_branch(alternate);
+        }
+    }
+
     fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
         walk_mut::walk_statements(self, statements);
 
@@ -41,6 +54,18 @@ impl<'a> VisitMut<'a> for ConditionalRenderer<'a> {
 }
 
 impl<'a> ConditionalRenderer<'a> {
+    fn render_if_branch(&self, branch: &mut Statement<'a>) {
+        let Statement::ExpressionStatement(expression_statement) = branch else {
+            return;
+        };
+
+        let Some(statements) = self.render_expression(&expression_statement.expression) else {
+            return;
+        };
+
+        *branch = self.block_statement_from_body(expression_statement.span, statements);
+    }
+
     fn render_statement(&self, statement: Statement<'a>) -> oxc_allocator::Vec<'a, Statement<'a>> {
         match statement {
             Statement::ExpressionStatement(expression_statement) => {
@@ -360,6 +385,27 @@ if (a) {
 if (!(x == \"a\" || x == \"b\")) {
   if (x == \"c\") {
     finished();
+  }
+}
+",
+        );
+    }
+
+    #[test]
+    fn renders_logical_expression_in_if_branches() {
+        define_ast_inline_test(transform_ast)(
+            "
+if (x) null === state && a();
+else if (y) null !== state && b();
+",
+            "
+if (x) {
+  if (null === state) {
+    a();
+  }
+} else if (y) {
+  if (null !== state) {
+    b();
   }
 }
 ",
