@@ -5,7 +5,7 @@ use oxc_ast::{
 };
 use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::operator::{LogicalOperator, UnaryOperator};
+use oxc_syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 use wakaru_core::diagnostics::Result;
 use wakaru_core::source::ParsedSourceFile;
 
@@ -126,6 +126,10 @@ impl<'a> ConditionalRenderer<'a> {
         &self,
         conditional: &ConditionalExpression<'a>,
     ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        if let Some(statements) = self.render_switch_expression(conditional, false) {
+            return Some(statements);
+        }
+
         let true_branch = self.render_expression(&conditional.consequent)?;
         let mut false_branch = self.render_expression(&conditional.alternate)?;
 
@@ -143,6 +147,106 @@ impl<'a> ConditionalRenderer<'a> {
             self.block_statement_from_body(conditional.consequent.span(), true_branch),
             alternate,
         )))
+    }
+
+    fn render_switch_expression(
+        &self,
+        conditional: &ConditionalExpression<'a>,
+        is_return: bool,
+    ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        let base = comparison_base(&conditional.test)?;
+        let mut case_count = 0;
+        let mut cases = self.ast.vec();
+
+        self.collect_switch_cases(conditional, base, is_return, &mut cases, &mut case_count)?;
+        if case_count < 3 {
+            return None;
+        }
+
+        Some(self.single(self.ast.statement_switch(
+            conditional.span,
+            base.clone_in(self.ast.allocator),
+            cases,
+        )))
+    }
+
+    fn collect_switch_cases(
+        &self,
+        conditional: &ConditionalExpression<'a>,
+        base: &Expression<'a>,
+        is_return: bool,
+        cases: &mut oxc_allocator::Vec<'a, oxc_ast::ast::SwitchCase<'a>>,
+        case_count: &mut usize,
+    ) -> Option<()> {
+        let values = comparison_values(&conditional.test, base)?;
+        if values.is_empty() {
+            return None;
+        }
+
+        *case_count += values.len();
+        self.push_switch_cases(values, &conditional.consequent, is_return, cases)?;
+
+        match without_parentheses(&conditional.alternate) {
+            Expression::ConditionalExpression(alternate) => {
+                self.collect_switch_cases(alternate, base, is_return, cases, case_count)
+            }
+            alternate => {
+                let consequent = self.switch_case_body(alternate, is_return)?;
+                cases.push(self.ast.switch_case(alternate.span(), None, consequent));
+                Some(())
+            }
+        }
+    }
+
+    fn push_switch_cases(
+        &self,
+        values: Vec<&Expression<'a>>,
+        consequent: &Expression<'a>,
+        is_return: bool,
+        cases: &mut oxc_allocator::Vec<'a, oxc_ast::ast::SwitchCase<'a>>,
+    ) -> Option<()> {
+        let mut values = values.into_iter().peekable();
+        while let Some(value) = values.next() {
+            let consequent = if values.peek().is_some() {
+                self.ast.vec()
+            } else {
+                self.switch_case_body(consequent, is_return)?
+            };
+            cases.push(self.ast.switch_case(
+                value.span(),
+                Some(value.clone_in(self.ast.allocator)),
+                consequent,
+            ));
+        }
+
+        Some(())
+    }
+
+    fn switch_case_body(
+        &self,
+        expression: &Expression<'a>,
+        is_return: bool,
+    ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        if !should_render_leaf(expression) {
+            return None;
+        }
+
+        let mut body = self.ast.vec_with_capacity(2);
+        if is_return {
+            body.push(self.ast.statement_return(
+                expression.span(),
+                Some(expression.clone_in(self.ast.allocator)),
+            ));
+        } else {
+            body.push(
+                self.ast.statement_expression(
+                    expression.span(),
+                    expression.clone_in(self.ast.allocator),
+                ),
+            );
+            body.push(self.ast.statement_break(expression.span(), None));
+        }
+        Some(body)
     }
 
     fn render_logical_expression(
@@ -168,6 +272,10 @@ impl<'a> ConditionalRenderer<'a> {
         &self,
         conditional: &ConditionalExpression<'a>,
     ) -> oxc_allocator::Vec<'a, Statement<'a>> {
+        if let Some(statements) = self.render_switch_expression(conditional, true) {
+            return statements;
+        }
+
         let true_branch = self.render_return_expression(&conditional.consequent);
         let false_branch = self.render_return_expression(&conditional.alternate);
 
@@ -263,6 +371,96 @@ fn should_render_leaf(expression: &Expression) -> bool {
             | Expression::StringLiteral(_)
             | Expression::TemplateLiteral(_)
     )
+}
+
+fn comparison_base<'a, 'b>(expression: &'b Expression<'a>) -> Option<&'b Expression<'a>> {
+    match without_parentheses(expression) {
+        Expression::BinaryExpression(binary) if is_equality_operator(binary.operator) => {
+            if is_comparison_base(&binary.left) && is_value_literal(&binary.right) {
+                Some(without_parentheses(&binary.left))
+            } else if is_comparison_base(&binary.right) && is_value_literal(&binary.left) {
+                Some(without_parentheses(&binary.right))
+            } else {
+                None
+            }
+        }
+        Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+            let left = comparison_base(&logical.left)?;
+            let right = comparison_base(&logical.right)?;
+            expressions_equal(left, right).then_some(left)
+        }
+        _ => None,
+    }
+}
+
+fn comparison_values<'a, 'b>(
+    expression: &'b Expression<'a>,
+    base: &Expression<'a>,
+) -> Option<Vec<&'b Expression<'a>>> {
+    match without_parentheses(expression) {
+        Expression::BinaryExpression(binary) if is_equality_operator(binary.operator) => {
+            if expressions_equal(&binary.left, base) && is_value_literal(&binary.right) {
+                Some(vec![without_parentheses(&binary.right)])
+            } else if expressions_equal(&binary.right, base) && is_value_literal(&binary.left) {
+                Some(vec![without_parentheses(&binary.left)])
+            } else {
+                None
+            }
+        }
+        Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+            let mut values = comparison_values(&logical.left, base)?;
+            values.extend(comparison_values(&logical.right, base)?);
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
+fn is_equality_operator(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Equality | BinaryOperator::StrictEquality
+    )
+}
+
+fn is_comparison_base(expression: &Expression) -> bool {
+    !is_value_literal(expression)
+        && !matches!(
+            without_parentheses(expression),
+            Expression::CallExpression(_)
+        )
+}
+
+fn is_value_literal(expression: &Expression) -> bool {
+    matches!(
+        without_parentheses(expression),
+        Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::TemplateLiteral(_)
+    )
+}
+
+fn expressions_equal(left: &Expression, right: &Expression) -> bool {
+    match (without_parentheses(left), without_parentheses(right)) {
+        (Expression::Identifier(left), Expression::Identifier(right)) => left.name == right.name,
+        (Expression::ThisExpression(_), Expression::ThisExpression(_)) => true,
+        (Expression::StaticMemberExpression(left), Expression::StaticMemberExpression(right)) => {
+            left.property.name == right.property.name
+                && expressions_equal(&left.object, &right.object)
+        }
+        (
+            Expression::ComputedMemberExpression(left),
+            Expression::ComputedMemberExpression(right),
+        ) => {
+            expressions_equal(&left.object, &right.object)
+                && expressions_equal(&left.expression, &right.expression)
+        }
+        _ => false,
+    }
 }
 
 fn without_parentheses<'a, 'b>(expression: &'b Expression<'a>) -> &'b Expression<'a> {
@@ -406,6 +604,72 @@ if (x) {
 } else if (y) {
   if (null !== state) {
     b();
+  }
+}
+",
+        );
+    }
+
+    #[test]
+    fn renders_switch_from_repeated_comparison_ternaries() {
+        define_ast_inline_test(transform_ast)(
+            "
+foo == \"bar\" ? bar() : foo == \"baz\" ? baz() : foo == \"qux\" ? qux() : quux();
+e === 2 || e === 9 ? foo() : e === 3 ? bar() : e === 4 || e === 5 ? baz() : fail(e);
+",
+            "
+switch (foo) {
+  case \"bar\":
+    bar();
+    break;
+  case \"baz\":
+    baz();
+    break;
+  case \"qux\":
+    qux();
+    break;
+  default:
+    quux();
+    break;
+}
+switch (e) {
+  case 2:
+  case 9:
+    foo();
+    break;
+  case 3:
+    bar();
+    break;
+  case 4:
+  case 5:
+    baz();
+    break;
+  default:
+    fail(e);
+    break;
+}
+",
+        );
+    }
+
+    #[test]
+    fn renders_return_switch_from_repeated_comparison_ternaries() {
+        define_ast_inline_test(transform_ast)(
+            "
+function fn() {
+  return foo == \"bar\" ? bar() : foo == \"baz\" || foo == \"baz2\" ? baz() : foo == \"qux1\" || foo == \"qux2\" || foo == \"qux3\" ? qux() : quc();
+}
+",
+            "
+function fn() {
+  switch (foo) {
+    case \"bar\": return bar();
+    case \"baz\":
+    case \"baz2\": return baz();
+    case \"qux1\":
+    case \"qux2\":
+    case \"qux3\": return qux();
+    default: return quc();
   }
 }
 ",
