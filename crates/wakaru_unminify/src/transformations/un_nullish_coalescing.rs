@@ -530,6 +530,19 @@ l.foo.bar ?? false;
     }
 
     #[test]
+    fn restores_nullish_coalescing_after_optional_chaining() {
+        define_ast_inline_test(transform_ast)(
+            "
+var o;
+null !== (o = c.foo.bar?.baz.z) && void 0 !== o && o;
+",
+            "
+c.foo.bar?.baz.z ?? false;
+",
+        );
+    }
+
+    #[test]
     fn leaves_mismatched_guards_unchanged() {
         define_ast_inline_test(transform_ast)(
             "
