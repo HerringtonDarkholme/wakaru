@@ -15,15 +15,17 @@ use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::{ScopeId, Scoping, SemanticBuilder, SymbolId};
 use oxc_span::{GetSpan, Span};
 use wakaru_core::diagnostics::Result;
-use wakaru_core::source::ParsedSourceFile;
+use wakaru_core::source::{ParsedSourceFile, TransformationParams};
 
 pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
     let scoping = SemanticBuilder::new()
         .build(&source.program)
         .semantic
         .into_scoping();
+    let runtime_config = JsxRuntimeConfig::from_params(source.params);
 
     let mut rename_collector = ComponentRenameCollector {
+        runtime_config: runtime_config.clone(),
         scoping: &scoping,
         component_symbols: HashSet::new(),
         pending_display_names: Vec::new(),
@@ -42,6 +44,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
 
     let mut transformer = JsxTransformer {
         ast: AstBuilder::new(source.allocator),
+        runtime_config,
         dynamic_component_names: Vec::new(),
         pending_dynamic_components: Vec::new(),
         string_tag_declarations: HashMap::new(),
@@ -55,6 +58,7 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
 
 struct JsxTransformer<'a> {
     ast: AstBuilder<'a>,
+    runtime_config: JsxRuntimeConfig,
     dynamic_component_names: Vec<HashSet<String>>,
     pending_dynamic_components: Vec<(Span, String, Expression<'a>)>,
     string_tag_declarations: HashMap<String, String>,
@@ -67,7 +71,95 @@ enum Runtime {
     Automatic,
 }
 
+const DEFAULT_PRAGMA_CANDIDATES: &[&str] = &[
+    "createElement",
+    "jsx",
+    "jsxs",
+    "_jsx",
+    "_jsxs",
+    "jsxDEV",
+    "jsxsDEV",
+];
+
+const DEFAULT_PRAGMA_FRAG_CANDIDATES: &[&str] = &["Fragment"];
+
+#[derive(Clone, Debug)]
+struct JsxRuntimeConfig {
+    pragmas: Vec<String>,
+    pragma_frags: Vec<String>,
+}
+
+impl JsxRuntimeConfig {
+    fn from_params(params: &TransformationParams) -> Self {
+        Self {
+            pragmas: pragma_candidates(params.un_jsx_pragma.as_deref(), DEFAULT_PRAGMA_CANDIDATES),
+            pragma_frags: pragma_candidates(
+                params.un_jsx_pragma_frag.as_deref(),
+                DEFAULT_PRAGMA_FRAG_CANDIDATES,
+            ),
+        }
+    }
+
+    fn runtime(&self, callee: &Expression) -> Option<Runtime> {
+        match without_parentheses(callee) {
+            Expression::Identifier(identifier) => self.runtime_for_name(identifier.name.as_str()),
+            Expression::StaticMemberExpression(member) => {
+                let Expression::Identifier(object) = &member.object else {
+                    return None;
+                };
+                if object.name == "document" {
+                    return None;
+                }
+                self.runtime_for_name(member.property.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn is_fragment_tag(&self, tag: &JSXElementName) -> bool {
+        let name = match tag {
+            JSXElementName::Identifier(identifier) => Some(identifier.name.as_str()),
+            JSXElementName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+            JSXElementName::MemberExpression(member) => Some(member.property.name.as_str()),
+            _ => None,
+        };
+
+        name.is_some_and(|name| self.pragma_frags.iter().any(|candidate| candidate == name))
+    }
+
+    fn runtime_for_name(&self, name: &str) -> Option<Runtime> {
+        if !self.pragmas.iter().any(|candidate| candidate == name) {
+            return None;
+        }
+
+        Some(if automatic_runtime_name(name) {
+            Runtime::Automatic
+        } else {
+            Runtime::Classic
+        })
+    }
+}
+
+fn pragma_candidates(value: Option<&str>, defaults: &[&str]) -> Vec<String> {
+    match value {
+        Some(value) => vec![pragma_property(value).to_string()],
+        None => defaults.iter().map(|value| (*value).to_string()).collect(),
+    }
+}
+
+fn pragma_property(value: &str) -> &str {
+    value.rsplit('.').next().unwrap_or(value)
+}
+
+fn automatic_runtime_name(name: &str) -> bool {
+    matches!(
+        name,
+        "jsx" | "jsxs" | "_jsx" | "_jsxs" | "jsxDEV" | "jsxsDEV"
+    )
+}
+
 struct ComponentRenameCollector<'s> {
+    runtime_config: JsxRuntimeConfig,
     scoping: &'s Scoping,
     component_symbols: HashSet<SymbolId>,
     pending_display_names: Vec<(SymbolId, ScopeId, String)>,
@@ -100,7 +192,7 @@ impl ComponentRenameCollector<'_> {
         let Some(init) = &declarator.init else {
             return;
         };
-        if !expression_contains_jsx_runtime_call(init) {
+        if !expression_contains_jsx_runtime_call(init, &self.runtime_config) {
             return;
         }
         let Some(symbol_id) = identifier.symbol_id.get() else {
@@ -152,7 +244,7 @@ impl ComponentRenameCollector<'_> {
     }
 
     fn rename_lowercase_component(&mut self, call: &CallExpression) {
-        if jsx_runtime(&call.callee).is_none() {
+        if self.runtime_config.runtime(&call.callee).is_none() {
             return;
         }
 
@@ -263,6 +355,7 @@ impl<'a> VisitMut<'a> for SymbolRenamer<'a, '_> {
 }
 
 struct JsxRuntimeCallFinder {
+    runtime_config: JsxRuntimeConfig,
     found: bool,
 }
 
@@ -271,7 +364,7 @@ impl<'a> Visit<'a> for JsxRuntimeCallFinder {
         if self.found {
             return;
         }
-        if jsx_runtime(&call.callee).is_some() {
+        if self.runtime_config.runtime(&call.callee).is_some() {
             self.found = true;
             return;
         }
@@ -279,8 +372,14 @@ impl<'a> Visit<'a> for JsxRuntimeCallFinder {
     }
 }
 
-fn expression_contains_jsx_runtime_call(expression: &Expression) -> bool {
-    let mut finder = JsxRuntimeCallFinder { found: false };
+fn expression_contains_jsx_runtime_call(
+    expression: &Expression,
+    runtime_config: &JsxRuntimeConfig,
+) -> bool {
+    let mut finder = JsxRuntimeCallFinder {
+        runtime_config: runtime_config.clone(),
+        found: false,
+    };
     finder.visit_expression(expression);
     finder.found
 }
@@ -344,7 +443,7 @@ impl<'a> JsxTransformer<'a> {
         let Expression::CallExpression(call) = without_parentheses(expression) else {
             return None;
         };
-        let runtime = jsx_runtime(&call.callee)?;
+        let runtime = self.runtime_config.runtime(&call.callee)?;
         if call.arguments.len() < 2 {
             return None;
         }
@@ -376,7 +475,7 @@ impl<'a> JsxTransformer<'a> {
         }
 
         let span = call.span;
-        if attributes.is_empty() && is_fragment_tag(&tag) {
+        if attributes.is_empty() && self.runtime_config.is_fragment_tag(&tag) {
             return Some(Expression::JSXFragment(self.ast.alloc_jsx_fragment(
                 span,
                 self.ast.jsx_opening_fragment(span),
@@ -835,30 +934,6 @@ impl<'a> JsxTransformer<'a> {
     }
 }
 
-fn jsx_runtime(callee: &Expression) -> Option<Runtime> {
-    match without_parentheses(callee) {
-        Expression::Identifier(identifier) => match identifier.name.as_str() {
-            "createElement" => Some(Runtime::Classic),
-            "jsx" | "jsxs" | "_jsx" | "_jsxs" | "jsxDEV" | "jsxsDEV" => Some(Runtime::Automatic),
-            _ => None,
-        },
-        Expression::StaticMemberExpression(member) => {
-            let Expression::Identifier(object) = &member.object else {
-                return None;
-            };
-            if object.name == "document" {
-                return None;
-            }
-            match member.property.name.as_str() {
-                "createElement" => Some(Runtime::Classic),
-                "jsx" | "jsxs" | "jsxDEV" | "jsxsDEV" => Some(Runtime::Automatic),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 fn string_tag_declaration<'a>(statement: &'a Statement<'a>) -> Option<(&'a str, &'a str)> {
     let Statement::VariableDeclaration(declaration) = statement else {
         return None;
@@ -1029,15 +1104,6 @@ fn capitalization_invalid(tag: &JSXElementName) -> bool {
             .chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_lowercase()),
-        _ => false,
-    }
-}
-
-fn is_fragment_tag(tag: &JSXElementName) -> bool {
-    match tag {
-        JSXElementName::Identifier(identifier) => identifier.name == "Fragment",
-        JSXElementName::IdentifierReference(identifier) => identifier.name == "Fragment",
-        JSXElementName::MemberExpression(member) => member.property.name == "Fragment",
         _ => false,
     }
 }
@@ -1381,7 +1447,8 @@ fn expression_to_jsx_expression(expression: Expression) -> JSXExpression {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::define_ast_inline_test;
+    use crate::test_utils::{define_ast_inline_test, define_ast_inline_test_with_params};
+    use wakaru_core::source::TransformationParams;
 
     #[test]
     fn restores_simple_classic_jsx() {
@@ -1399,6 +1466,53 @@ function fn() {
             r#"
 function fn() {
   return <div className="flex flex-col" num={1} foo={bar} disabled />;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn restores_custom_classic_pragma() {
+        define_ast_inline_test_with_params(
+            transform_ast,
+            TransformationParams {
+                un_jsx_pragma: Some("h".to_string()),
+                ..TransformationParams::default()
+            },
+        )(
+            r#"
+function fn() {
+  return h("div", { id: "app" }, "Hello");
+}
+React.createElement("span", null);
+"#,
+            r#"
+function fn() {
+  return <div id="app">Hello</div>;
+}
+React.createElement("span", null);
+"#,
+        );
+    }
+
+    #[test]
+    fn restores_custom_dotted_pragma_and_fragment() {
+        define_ast_inline_test_with_params(
+            transform_ast,
+            TransformationParams {
+                un_jsx_pragma: Some("Preact.h".to_string()),
+                un_jsx_pragma_frag: Some("Preact.Frag".to_string()),
+                ..TransformationParams::default()
+            },
+        )(
+            r#"
+function fn() {
+  return Preact.h(Frag, null, Preact.h("span", null, "Hello"));
+}
+"#,
+            r#"
+function fn() {
+  return <><span>Hello</span></>;
 }
 "#,
         );

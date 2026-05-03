@@ -79,6 +79,8 @@ pub struct TransformationParams {
     pub module_mapping: ModuleMapping,
     pub module_meta: ModuleMetaMap,
     pub un_esm_hoist: bool,
+    pub un_jsx_pragma: Option<String>,
+    pub un_jsx_pragma_frag: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

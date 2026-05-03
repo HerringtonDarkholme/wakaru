@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(long)]
     pub perf: bool,
 
+    #[arg(long)]
+    pub jsx_pragma: Option<String>,
+
+    #[arg(long)]
+    pub jsx_pragma_frag: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

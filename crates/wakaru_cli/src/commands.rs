@@ -103,6 +103,8 @@ pub fn run(cli: Cli) -> Result<()> {
         let params = PipelineParams {
             module_mapping: module_mapping(&modules),
             module_meta: module_meta_map(&modules),
+            un_jsx_pragma: cli.jsx_pragma.clone(),
+            un_jsx_pragma_frag: cli.jsx_pragma_frag.clone(),
             ..PipelineParams::default()
         };
         let start = Instant::now();
