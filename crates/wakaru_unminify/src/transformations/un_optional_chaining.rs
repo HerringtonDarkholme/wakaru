@@ -270,6 +270,8 @@ impl<'a> OptionalChainingTransformer<'a> {
                         span,
                         target.clone_in(self.ast.allocator),
                         call,
+                        target,
+                        temp_name,
                     );
                 }
 
@@ -425,7 +427,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         member.property.clone_in(self.ast.allocator),
                         true,
                     ));
-                self.optional_apply_call(span, callee, call)
+                self.optional_apply_call(span, callee, call, target, temp_name)
             }
             Expression::ComputedMemberExpression(member)
                 if identifier_name(&member.object) == Some(temp_name) =>
@@ -446,7 +448,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         true,
                     ),
                 );
-                self.optional_apply_call(span, callee, call)
+                self.optional_apply_call(span, callee, call, target, temp_name)
             }
             _ => None,
         }
@@ -457,13 +459,15 @@ impl<'a> OptionalChainingTransformer<'a> {
         span: Span,
         callee: Expression<'a>,
         call: &CallExpression<'a>,
+        target: &Expression<'a>,
+        temp_name: &str,
     ) -> Option<Expression<'a>> {
         let argument = call.arguments.get(1)?;
         if matches!(argument, Argument::SpreadElement(_)) {
             return None;
         }
 
-        let arguments = self.apply_arguments(argument);
+        let arguments = self.apply_arguments(span, target, temp_name, argument);
         let expression = Expression::CallExpression(self.ast.alloc_call_expression_with_pure(
             call.span,
             callee,
@@ -476,11 +480,22 @@ impl<'a> OptionalChainingTransformer<'a> {
         Some(self.ast.expression_chain(span, chain_element))
     }
 
-    fn apply_arguments(&self, argument: &Argument<'a>) -> oxc_allocator::Vec<'a, Argument<'a>> {
+    fn apply_arguments(
+        &self,
+        span: Span,
+        target: &Expression<'a>,
+        temp_name: &str,
+        argument: &Argument<'a>,
+    ) -> oxc_allocator::Vec<'a, Argument<'a>> {
         if let Some(Expression::ArrayExpression(array)) = argument.as_expression() {
             let mut arguments = self.ast.vec_with_capacity(array.elements.len());
             for element in &array.elements {
-                arguments.push(array_element_to_argument(self.ast, element));
+                let argument = array_element_to_argument(self.ast, element);
+                if matches!(argument, Argument::SpreadElement(_)) {
+                    arguments.push(argument);
+                } else {
+                    arguments.push(self.optional_call_argument(span, target, temp_name, &argument));
+                }
             }
             return arguments;
         }
@@ -1323,6 +1338,21 @@ var _foo, _bar, _baz;
 foo?.(...args);
 foo.bar?.(baz, qux);
 foo?.bar?.(...args);
+",
+        );
+    }
+
+    #[test]
+    fn restores_optional_apply_array_arguments_with_nested_guards() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo, _bar;
+(_foo = foo) === null || _foo === void 0 ? void 0 : _foo.apply(void 0, [foo.bar, ...args]);
+foo === null || foo === void 0 || (_bar = foo.bar) === null || _bar === void 0 || _bar.apply(foo, [foo.bar, ...args]);
+",
+            "
+foo?.(foo?.bar, ...args);
+foo?.bar?.(foo?.bar, ...args);
 ",
         );
     }
