@@ -482,6 +482,26 @@ var foo = function(...args) {
     }
 
     #[test]
+    fn replaces_arguments_in_class_methods() {
+        define_ast_inline_test(transform_ast)(
+            "
+class Foo {
+  bar() {
+    console.log(arguments);
+  }
+}
+",
+            "
+class Foo {
+  bar(...args) {
+    console.log(args);
+  }
+}
+",
+        );
+    }
+
+    #[test]
     fn restores_generated_rest_loop_without_formal_params() {
         define_ast_inline_test(transform_ast)(
             "
