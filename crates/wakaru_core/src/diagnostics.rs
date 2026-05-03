@@ -69,7 +69,26 @@ impl WakaruError {
 
 impl Display for WakaruError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        writeln!(f, "{}", self.message)?;
+        for diagnostic in &self.diagnostics {
+            let severity = match diagnostic.severity {
+                DiagnosticSeverity::Error => "error",
+                DiagnosticSeverity::Warning => "warning",
+                DiagnosticSeverity::Info => "info",
+            };
+            write!(f, "{severity}")?;
+            if let Some(path) = &diagnostic.path {
+                write!(f, " {}", path.display())?;
+            }
+            if let Some(line) = diagnostic.line {
+                write!(f, ":{line}")?;
+                if let Some(column) = diagnostic.column {
+                    write!(f, ":{column}")?;
+                }
+            }
+            writeln!(f, ": {}", diagnostic.message)?;
+        }
+        Ok(())
     }
 }
 
