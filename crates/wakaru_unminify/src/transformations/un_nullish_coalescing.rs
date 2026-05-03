@@ -58,21 +58,25 @@ impl<'a> NullishCoalescingTransformer<'a> {
             return None;
         };
 
-        let guard = nullish_guard(conditional)?;
-        let target = match guard {
-            NullishGuard::Direct(target) => target,
-            NullishGuard::Temp { name, target } => {
-                self.unused_temps.insert(name.to_string());
-                target
-            }
-        };
+        if let Some(guard) = nullish_guard(conditional) {
+            let target = self.guard_target(guard);
+            return Some(self.ast.expression_logical(
+                conditional.span,
+                target.clone_in(self.ast.allocator),
+                LogicalOperator::Coalesce,
+                conditional.alternate.clone_in(self.ast.allocator),
+            ));
+        }
 
-        Some(self.ast.expression_logical(
-            conditional.span,
-            target.clone_in(self.ast.allocator),
-            LogicalOperator::Coalesce,
-            conditional.alternate.clone_in(self.ast.allocator),
-        ))
+        Some(
+            self.ast.expression_logical(
+                conditional.span,
+                self.guard_target(negated_nullish_guard(conditional)?)
+                    .clone_in(self.ast.allocator),
+                LogicalOperator::Coalesce,
+                conditional.consequent.clone_in(self.ast.allocator),
+            ),
+        )
     }
 
     fn convert_logical_expression(
@@ -101,6 +105,16 @@ impl<'a> NullishCoalescingTransformer<'a> {
             LogicalOperator::Coalesce,
             self.ast.expression_boolean_literal(logical.span, false),
         ))
+    }
+
+    fn guard_target<'b>(&mut self, guard: NullishGuard<'a, 'b>) -> &'b Expression<'a> {
+        match guard {
+            NullishGuard::Direct(target) => target,
+            NullishGuard::Temp { name, target } => {
+                self.unused_temps.insert(name.to_string());
+                target
+            }
+        }
     }
 
     fn remove_unused_temp_declarations(
@@ -168,6 +182,12 @@ fn nullish_guard<'a, 'b>(
     nullish_test_guard(&conditional.test, &conditional.consequent)
 }
 
+fn negated_nullish_guard<'a, 'b>(
+    conditional: &'b ConditionalExpression<'a>,
+) -> Option<NullishGuard<'a, 'b>> {
+    negated_nullish_test_guard(&conditional.test, &conditional.alternate)
+}
+
 fn nullish_test_guard<'a, 'b>(
     test: &'b Expression<'a>,
     consequent: &'b Expression<'a>,
@@ -199,6 +219,37 @@ fn nullish_test_guard<'a, 'b>(
     }
 }
 
+fn negated_nullish_test_guard<'a, 'b>(
+    test: &'b Expression<'a>,
+    alternate: &'b Expression<'a>,
+) -> Option<NullishGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(test) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::Or {
+        return None;
+    }
+
+    let null_checked = null_check(without_parentheses(&logical.left))?;
+    let undefined_checked = undefined_check(without_parentheses(&logical.right))?;
+
+    match (null_checked, undefined_checked) {
+        (CheckedExpression::Direct(left_target), CheckedExpression::Direct(right_target))
+            if expressions_equal(left_target, right_target)
+                && expressions_equal(left_target, alternate) =>
+        {
+            Some(NullishGuard::Direct(left_target))
+        }
+        (CheckedExpression::Temp { name, target }, CheckedExpression::Direct(right_target))
+            if identifier_name(right_target) == Some(name)
+                && identifier_name(alternate) == Some(name) =>
+        {
+            Some(NullishGuard::Temp { name, target })
+        }
+        _ => None,
+    }
+}
+
 enum CheckedExpression<'a, 'b> {
     Direct(&'b Expression<'a>),
     Temp {
@@ -212,6 +263,20 @@ fn non_null_check<'a, 'b>(expression: &'b Expression<'a>) -> Option<CheckedExpre
         return None;
     };
     if !is_inequality_operator(binary.operator) {
+        return None;
+    }
+
+    if let Some(result) = compared_to_null(&binary.left, &binary.right) {
+        return Some(result);
+    }
+    compared_to_null(&binary.right, &binary.left)
+}
+
+fn null_check<'a, 'b>(expression: &'b Expression<'a>) -> Option<CheckedExpression<'a, 'b>> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_equality_operator(binary.operator) {
         return None;
     }
 
@@ -244,6 +309,24 @@ fn non_undefined_check<'a, 'b>(
         return None;
     };
     if !is_inequality_operator(binary.operator) {
+        return None;
+    }
+
+    if is_undefined_expression(&binary.right) {
+        return Some(CheckedExpression::Direct(&binary.left));
+    }
+    if is_undefined_expression(&binary.left) {
+        return Some(CheckedExpression::Direct(&binary.right));
+    }
+
+    None
+}
+
+fn undefined_check<'a, 'b>(expression: &'b Expression<'a>) -> Option<CheckedExpression<'a, 'b>> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_equality_operator(binary.operator) {
         return None;
     }
 
@@ -311,6 +394,13 @@ fn is_inequality_operator(operator: BinaryOperator) -> bool {
     )
 }
 
+fn is_equality_operator(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Equality | BinaryOperator::StrictEquality
+    )
+}
+
 fn is_undefined_expression(expression: &Expression) -> bool {
     match without_parentheses(expression) {
         Expression::Identifier(identifier) => identifier.name == "undefined",
@@ -362,8 +452,10 @@ mod tests {
         define_ast_inline_test(transform_ast)(
             "
 foo !== null && foo !== void 0 ? foo : \"bar\";
+foo === null || foo === void 0 ? \"bar\" : foo;
 ",
             "
+foo ?? \"bar\";
 foo ?? \"bar\";
 ",
         );
@@ -373,11 +465,28 @@ foo ?? \"bar\";
     fn restores_temp_assignment_nullish_coalescing() {
         define_ast_inline_test(transform_ast)(
             "
-var _ref;
+var _ref, _foo;
 (_ref = foo.bar) !== null && _ref !== void 0 ? _ref : \"qux\";
+(_foo = foo.bar) === null || _foo === void 0 ? \"qux\" : _foo;
 ",
             "
 foo.bar ?? \"qux\";
+foo.bar ?? \"qux\";
+",
+        );
+    }
+
+    #[test]
+    fn restores_nested_nullish_coalescing() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _ref, _foo;
+(_ref = foo !== null && foo !== void 0 ? foo : bar) !== null && _ref !== void 0 ? _ref : \"quz\";
+(_foo = foo === null || foo === void 0 ? bar : foo) === null || _foo === void 0 ? \"quz\" : _foo;
+",
+            "
+foo ?? bar ?? \"quz\";
+foo ?? bar ?? \"quz\";
 ",
         );
     }
