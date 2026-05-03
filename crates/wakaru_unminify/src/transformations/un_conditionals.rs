@@ -44,7 +44,7 @@ impl<'a> ConditionalRenderer<'a> {
     fn render_statement(&self, statement: Statement<'a>) -> oxc_allocator::Vec<'a, Statement<'a>> {
         match statement {
             Statement::ExpressionStatement(expression_statement) => {
-                self.single(self.render_expression_statement(expression_statement.unbox()))
+                self.render_expression_statement(expression_statement.unbox())
             }
             Statement::ReturnStatement(return_statement) => {
                 let Some(Expression::ConditionalExpression(conditional)) =
@@ -66,44 +66,77 @@ impl<'a> ConditionalRenderer<'a> {
     fn render_expression_statement(
         &self,
         expression_statement: ExpressionStatement<'a>,
-    ) -> Statement<'a> {
+    ) -> oxc_allocator::Vec<'a, Statement<'a>> {
         let span = expression_statement.span;
-        match &expression_statement.expression {
-            Expression::ConditionalExpression(conditional)
-                if should_render_leaf(&conditional.consequent)
-                    && should_render_leaf(&conditional.alternate) =>
-            {
-                let consequent = self.block_statement(conditional.consequent.span(), |body| {
-                    body.push(self.ast.statement_expression(
-                        conditional.consequent.span(),
-                        conditional.consequent.clone_in(self.ast.allocator),
-                    ));
-                });
-                let alternate = self.block_statement(conditional.alternate.span(), |body| {
-                    body.push(self.ast.statement_expression(
-                        conditional.alternate.span(),
-                        conditional.alternate.clone_in(self.ast.allocator),
-                    ));
-                });
-                self.ast.statement_if(
-                    span,
-                    conditional.test.clone_in(self.ast.allocator),
-                    consequent,
-                    Some(alternate),
-                )
-            }
-            Expression::LogicalExpression(logical) => {
-                if let Some(statement) = self.render_logical_expression_statement(span, logical) {
-                    statement
-                } else {
-                    self.ast
-                        .statement_expression(span, expression_statement.expression)
-                }
-            }
-            _ => self
-                .ast
-                .statement_expression(span, expression_statement.expression),
+        if let Some(statements) = self.render_expression(&expression_statement.expression) {
+            return statements;
         }
+
+        self.single(
+            self.ast
+                .statement_expression(span, expression_statement.expression),
+        )
+    }
+
+    fn render_expression(
+        &self,
+        expression: &Expression<'a>,
+    ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        match without_parentheses(expression) {
+            Expression::ConditionalExpression(conditional) => {
+                self.render_conditional_expression(conditional)
+            }
+            Expression::LogicalExpression(logical) => self.render_logical_expression(logical),
+            expression if should_render_leaf(expression) => {
+                Some(self.single(self.ast.statement_expression(
+                    expression.span(),
+                    expression.clone_in(self.ast.allocator),
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    fn render_conditional_expression(
+        &self,
+        conditional: &ConditionalExpression<'a>,
+    ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        let true_branch = self.render_expression(&conditional.consequent)?;
+        let mut false_branch = self.render_expression(&conditional.alternate)?;
+
+        let alternate = if false_branch.len() == 1
+            && matches!(false_branch.first(), Some(Statement::IfStatement(_)))
+        {
+            false_branch.pop()
+        } else {
+            Some(self.block_statement_from_body(conditional.alternate.span(), false_branch))
+        };
+
+        Some(self.single(self.ast.statement_if(
+            conditional.span,
+            conditional.test.clone_in(self.ast.allocator),
+            self.block_statement_from_body(conditional.consequent.span(), true_branch),
+            alternate,
+        )))
+    }
+
+    fn render_logical_expression(
+        &self,
+        logical: &LogicalExpression<'a>,
+    ) -> Option<oxc_allocator::Vec<'a, Statement<'a>>> {
+        let test = match logical.operator {
+            LogicalOperator::And => logical.left.clone_in(self.ast.allocator),
+            LogicalOperator::Or => self.negate_condition(&logical.left),
+            LogicalOperator::Coalesce => return None,
+        };
+        let body = self.render_expression(&logical.right)?;
+
+        Some(self.single(self.ast.statement_if(
+            logical.span,
+            test,
+            self.block_statement_from_body(logical.right.span(), body),
+            None,
+        )))
     }
 
     fn render_return_conditional(
@@ -142,30 +175,6 @@ impl<'a> ConditionalRenderer<'a> {
         ))
     }
 
-    fn render_logical_expression_statement(
-        &self,
-        span: Span,
-        logical: &LogicalExpression<'a>,
-    ) -> Option<Statement<'a>> {
-        if !should_render_leaf(&logical.right) {
-            return None;
-        }
-
-        let test = match logical.operator {
-            LogicalOperator::And => logical.left.clone_in(self.ast.allocator),
-            LogicalOperator::Or => self.negate_condition(&logical.left),
-            LogicalOperator::Coalesce => return None,
-        };
-        let consequent = self.block_statement(logical.right.span(), |body| {
-            body.push(self.ast.statement_expression(
-                logical.right.span(),
-                logical.right.clone_in(self.ast.allocator),
-            ));
-        });
-
-        Some(self.ast.statement_if(span, test, consequent, None))
-    }
-
     fn negate_condition(&self, expression: &Expression<'a>) -> Expression<'a> {
         match expression {
             Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
@@ -177,16 +186,6 @@ impl<'a> ConditionalRenderer<'a> {
                 expression.clone_in(self.ast.allocator),
             ),
         }
-    }
-
-    fn block_statement(
-        &self,
-        span: Span,
-        build: impl FnOnce(&mut oxc_allocator::Vec<'a, Statement<'a>>),
-    ) -> Statement<'a> {
-        let mut body = self.ast.vec();
-        build(&mut body);
-        self.ast.statement_block(span, body)
     }
 
     fn block_statement_from_body(
@@ -229,7 +228,7 @@ fn has_conditional_branch(conditional: &ConditionalExpression) -> bool {
 
 fn should_render_leaf(expression: &Expression) -> bool {
     !matches!(
-        expression,
+        without_parentheses(expression),
         Expression::Identifier(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
@@ -239,6 +238,15 @@ fn should_render_leaf(expression: &Expression) -> bool {
             | Expression::StringLiteral(_)
             | Expression::TemplateLiteral(_)
     )
+}
+
+fn without_parentheses<'a, 'b>(expression: &'b Expression<'a>) -> &'b Expression<'a> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            without_parentheses(&parenthesized.expression)
+        }
+        _ => expression,
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +265,48 @@ if (x) {
   a();
 } else {
   b();
+}
+",
+        );
+    }
+
+    #[test]
+    fn renders_nested_ternary_expression_statements() {
+        define_ast_inline_test(transform_ast)(
+            "
+a ? b() : c ? d() : e() ? g ? h() : i() : j();
+foo ? x() : bar ? y() : baz && z();
+foo ? x() : bar ? y() : baz ? z() : t();
+",
+            "
+if (a) {
+  b();
+} else if (c) {
+  d();
+} else if (e()) {
+  if (g) {
+    h();
+  } else {
+    i();
+  }
+} else {
+  j();
+}
+if (foo) {
+  x();
+} else if (bar) {
+  y();
+} else if (baz) {
+  z();
+}
+if (foo) {
+  x();
+} else if (bar) {
+  y();
+} else if (baz) {
+  z();
+} else {
+  t();
 }
 ",
         );
@@ -286,6 +336,32 @@ if (x) {
   b();
 }
 x ?? c();
+",
+        );
+    }
+
+    #[test]
+    fn renders_nested_logical_expression_statements() {
+        define_ast_inline_test(transform_ast)(
+            "
+a ? b() : c ? d() : e() && (g || h());
+x == 'a' || x == 'b' || x == 'c' && finished();
+",
+            "
+if (a) {
+  b();
+} else if (c) {
+  d();
+} else if (e()) {
+  if (!g) {
+    h();
+  }
+}
+if (!(x == \"a\" || x == \"b\")) {
+  if (x == \"c\") {
+    finished();
+  }
+}
 ",
         );
     }
