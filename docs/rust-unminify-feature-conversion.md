@@ -234,7 +234,7 @@ This list records the audited migration order for the default `packages/unminify
 | 36 | `un-parameter-rest` | partial | Semantic slice converts parameterless non-arrow functions that use implicit `arguments` into `...args`, including references from nested arrows, and recognizes Babel generated rest-copy loops with zero or existing-formal-parameter offsets. Remaining gap: exact upstream scope edge parity. |
 | 37 | `un-parameters` | partial | Public composite registry entry is wired and currently runs the ported `un-default-parameter` and `un-parameter-rest` slices in TS order. |
 | 38 | `un-argument-spread` | done | AST mutate pass converting safe `fn.apply(undefined/null, args)` and receiver-matched `obj.fn.apply(obj, args)` / computed-member variants to spread calls; wired. |
-| 39 | `un-jsx` | partial | AST slice converts classic `createElement`/`React.createElement` calls for string/component/member tags, null/object/spread props, simple boolean/string/expression attributes, spread props, simple/nested children, and attribute-free classic fragments. Remaining gaps: automatic runtime, fragments with attributes beyond component fallback, dynamic component hoisting, component renaming, constant tag inlining, React/Object spread helper flattening, pure annotation cleanup, and full formatting parity. |
+| 39 | `un-jsx` | done | Default-registry JSX recovery is ported for classic and automatic runtimes: string/component/member/namespaced tags, object/spread/computed props, React/Object spread helper flattening, children/key recovery, fragments, dynamic component hoisting with local name collision avoidance, constant string tag inlining, lowercase component binding renames, displayName-based renames, document.createElement exclusion, and pure annotation cleanup through AST replacement/codegen. Custom pragma parameters are not exposed by the Rust CLI yet. |
 | 40 | `un-es6-class` | skipped | Do not port for now. Keep the mirrored no-op AST registry entry; class reconstruction is large, helper-sensitive, and not worth prioritizing in the Rust migration. |
 | 41 | `un-async-await` | skipped | Do not port for now. Keep the mirrored no-op AST registry entry; reconstructing `__generator` / `__awaiter` is control-flow heavy and not worth prioritizing in the Rust migration. |
 | 42 | `oxfmt-1` | done | Final formatting pass. |
@@ -252,7 +252,6 @@ Work this list one pass at a time. Each item must either become `done` in the or
 | 34 | `un-conditionals` | Broader nested decision-tree rendering, switch reconstruction, logical trees beyond one level, and statement-container parity. |
 | 35 | `un-default-parameter` | Broader scope/reference safety, exact TS generated-name parity, rest interaction, and full statement-container parity. |
 | 36 | `un-parameter-rest` / `un-parameters` | Exact upstream scope edge parity for rest conversion and composite verification after parameter slices are complete. |
-| 39 | `un-jsx` | Automatic runtime, fragments with attributes beyond component fallback, dynamic component hoisting, component renaming, constant tag inlining, React/Object spread helper flattening, pure annotation cleanup, and full formatting parity. |
 
 ## Example: `un-use-strict`
 
