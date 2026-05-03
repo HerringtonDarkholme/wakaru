@@ -79,6 +79,10 @@ impl<'a> OptionalChainingTransformer<'a> {
             return None;
         };
 
+        if let Some(replacement) = self.convert_flat_logical_expression(logical) {
+            return Some(replacement);
+        }
+
         let guard = match logical.operator {
             LogicalOperator::Or => optional_or_guard(&logical.left)?,
             LogicalOperator::And => optional_and_guard(&logical.left)?,
@@ -98,6 +102,52 @@ impl<'a> OptionalChainingTransformer<'a> {
         Some(replacement)
     }
 
+    fn convert_flat_logical_expression(
+        &mut self,
+        logical: &oxc_ast::ast::LogicalExpression<'a>,
+    ) -> Option<Expression<'a>> {
+        let mut operands = Vec::new();
+        collect_logical_operands(&logical.left, logical.operator, &mut operands);
+        collect_logical_operands(&logical.right, logical.operator, &mut operands);
+        if operands.len() < 3 || operands.len() % 2 == 0 {
+            return None;
+        }
+
+        let mut current = operands.last()?.clone_in(self.ast.allocator);
+        let mut unused_temps = Vec::new();
+        let mut index = operands.len() - 3;
+
+        loop {
+            let guard = match logical.operator {
+                LogicalOperator::Or => {
+                    optional_or_guard_pair(operands[index], operands[index + 1])?
+                }
+                LogicalOperator::And => {
+                    optional_and_guard_pair(operands[index], operands[index + 1])?
+                }
+                _ => return None,
+            };
+
+            current = self.optional_chain_expression(
+                logical.span,
+                guard.target,
+                guard.temp_name,
+                &current,
+            )?;
+            if let Some(temp_name) = guard.unused_temp {
+                unused_temps.push(temp_name.to_string());
+            }
+
+            if index == 0 {
+                break;
+            }
+            index -= 2;
+        }
+
+        self.unused_temps.extend(unused_temps);
+        Some(current)
+    }
+
     fn optional_chain_expression(
         &self,
         span: Span,
@@ -108,6 +158,10 @@ impl<'a> OptionalChainingTransformer<'a> {
         let expression = match without_parentheses(member) {
             Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
                 self.optional_member_access(object, temp_name, member)?
+            }
+            Expression::ChainExpression(chain) => {
+                let expression = Expression::from(chain.expression.clone_in(self.ast.allocator));
+                return self.optional_chain_expression(span, object, temp_name, &expression);
             }
             Expression::CallExpression(call) => {
                 return self.optional_call_expression(span, object, temp_name, call);
@@ -147,7 +201,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         member.span,
                         object,
                         member.property.clone_in(self.ast.allocator),
-                        optional,
+                        optional || member.optional,
                     ),
                 ))
             }
@@ -159,7 +213,7 @@ impl<'a> OptionalChainingTransformer<'a> {
                         member.span,
                         object,
                         member.expression.clone_in(self.ast.allocator),
-                        optional,
+                        optional || member.optional,
                     ),
                 ))
             }
@@ -569,16 +623,30 @@ struct OptionalOrGuard<'a, 'b> {
     unused_temp: Option<&'b str>,
 }
 
-fn optional_or_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalOrGuard<'a, 'b>> {
+fn collect_logical_operands<'a, 'b>(
+    expression: &'b Expression<'a>,
+    operator: LogicalOperator,
+    operands: &mut Vec<&'b Expression<'a>>,
+) {
     let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
-        return None;
+        operands.push(without_parentheses(expression));
+        return;
     };
-    if logical.operator != LogicalOperator::Or {
-        return None;
+    if logical.operator != operator {
+        operands.push(without_parentheses(expression));
+        return;
     }
 
-    if let Some((temp_name, target)) = assignment_null_check(without_parentheses(&logical.left)) {
-        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+    collect_logical_operands(&logical.left, operator, operands);
+    collect_logical_operands(&logical.right, operator, operands);
+}
+
+fn optional_or_guard_pair<'a, 'b>(
+    left: &'b Expression<'a>,
+    right: &'b Expression<'a>,
+) -> Option<OptionalOrGuard<'a, 'b>> {
+    if let Some((temp_name, target)) = assignment_null_check(without_parentheses(left)) {
+        if identifier_nullish_check(without_parentheses(right), temp_name) {
             return Some(OptionalOrGuard {
                 temp_name,
                 target,
@@ -587,8 +655,46 @@ fn optional_or_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalO
         }
     }
 
-    if let Some((temp_name, target)) = identifier_null_check(without_parentheses(&logical.left)) {
-        if identifier_nullish_check(without_parentheses(&logical.right), temp_name) {
+    if let Some((temp_name, target)) = identifier_null_check(without_parentheses(left)) {
+        if identifier_nullish_check(without_parentheses(right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn optional_or_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalOrGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::Or {
+        return None;
+    }
+
+    optional_or_guard_pair(&logical.left, &logical.right)
+}
+
+fn optional_and_guard_pair<'a, 'b>(
+    left: &'b Expression<'a>,
+    right: &'b Expression<'a>,
+) -> Option<OptionalOrGuard<'a, 'b>> {
+    if let Some((temp_name, target)) = assignment_not_null_check(without_parentheses(left)) {
+        if identifier_not_nullish_check(without_parentheses(right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: Some(temp_name),
+            });
+        }
+    }
+
+    if let Some((temp_name, target)) = identifier_not_null_check(without_parentheses(left)) {
+        if identifier_not_nullish_check(without_parentheses(right), temp_name) {
             return Some(OptionalOrGuard {
                 temp_name,
                 target,
@@ -608,29 +714,7 @@ fn optional_and_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<Optional
         return None;
     }
 
-    if let Some((temp_name, target)) = assignment_not_null_check(without_parentheses(&logical.left))
-    {
-        if identifier_not_nullish_check(without_parentheses(&logical.right), temp_name) {
-            return Some(OptionalOrGuard {
-                temp_name,
-                target,
-                unused_temp: Some(temp_name),
-            });
-        }
-    }
-
-    if let Some((temp_name, target)) = identifier_not_null_check(without_parentheses(&logical.left))
-    {
-        if identifier_not_nullish_check(without_parentheses(&logical.right), temp_name) {
-            return Some(OptionalOrGuard {
-                temp_name,
-                target,
-                unused_temp: None,
-            });
-        }
-    }
-
-    None
+    optional_and_guard_pair(&logical.left, &logical.right)
 }
 
 fn identifier_null_check<'a, 'b>(
@@ -966,6 +1050,23 @@ a?.b;
     }
 
     #[test]
+    fn restores_nested_babel_swc_member_access() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _c_d, _c;
+(_c = c) === null || _c === void 0 ? void 0 : (_c_d = _c.d) === null || _c_d === void 0 ? void 0 : _c_d.e;
+
+var _a_b_c, _a_b;
+(_a_b = a.b) === null || _a_b === void 0 ? void 0 : (_a_b_c = _a_b.c) === null || _a_b_c === void 0 ? void 0 : _a_b_c.d.e;
+",
+            "
+c?.d?.e;
+a.b?.c?.d.e;
+",
+        );
+    }
+
+    #[test]
     fn restores_computed_member_access() {
         define_ast_inline_test(transform_ast)(
             "
@@ -1008,14 +1109,21 @@ foo?.bar(baz);
     fn restores_logical_or_member_access() {
         define_ast_inline_test(transform_ast)(
             "
-var _foo;
+var _foo, _a, _a_b, _a_b_c;
 (_foo = foo) === null || _foo === void 0 || _foo.bar;
 
 foo === null || foo === void 0 || foo.baz;
+
+(_a = a) === null || _a === void 0 || (_a = _a.b.c) === null || _a === void 0 || _a.d.e;
+(_a_b = a.b) === null || _a_b === void 0 || (_a_b = _a_b.c.d) === null || _a_b === void 0 || _a_b.e;
+(_a_b_c = a.b.c) === null || _a_b_c === void 0 || (_a_b_c = _a_b_c.d) === null || _a_b_c === void 0 || _a_b_c.e;
 ",
             "
 foo?.bar;
 foo?.baz;
+a?.b.c?.d.e;
+a.b?.c.d?.e;
+a.b.c?.d?.e;
 ",
         );
     }
@@ -1039,17 +1147,19 @@ foo.bar?.(baz);
     fn restores_logical_and_truthy_guards() {
         define_ast_inline_test(transform_ast)(
             "
-var _foo, _bar, _baz;
+var _foo, _bar, _baz, _a;
 foo !== null && foo !== void 0 && foo.bar;
 (_foo = foo) !== null && _foo !== void 0 && _foo.bar;
 (_bar = foo) !== null && _bar !== void 0 && _bar(baz);
 (_baz = foo.bar) !== null && _baz !== void 0 && _baz.call(foo, baz);
+(_a = a) !== null && _a !== void 0 && (_a = _a.b.c) !== null && _a !== void 0 && _a.d.e;
 ",
             "
 foo?.bar;
 foo?.bar;
 foo?.(baz);
 foo.bar?.(baz);
+a?.b.c?.d.e;
 ",
         );
     }
