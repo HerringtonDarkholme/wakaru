@@ -543,6 +543,37 @@ c.foo.bar?.baz.z ?? false;
     }
 
     #[test]
+    fn restores_nullish_coalescing_in_common_containers() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo_bar, _foo_bar1, _opts_foo, _this;
+var { qux = (_foo_bar = foo.bar) !== null && _foo_bar !== void 0 ? _foo_bar : \"qux\" } = {};
+function foo(foo, qux = (_foo_bar1 = foo.bar) !== null && _foo_bar1 !== void 0 ? _foo_bar1 : \"qux\") {}
+function bar(bar, qux = bar !== null && bar !== void 0 ? bar : \"qux\") {}
+function foo2(opts) {
+  var value = (_opts_foo = opts.foo) !== null && _opts_foo !== void 0 ? _opts_foo : \"default\";
+}
+function foo3(foo, bar = foo !== null && foo !== void 0 ? foo : \"bar\") {}
+function foo4() {
+  var value = (_this = this) !== null && _this !== void 0 ? _this : {};
+}
+",
+            "
+var { qux = foo.bar ?? \"qux\" } = {};
+function foo(foo, qux = foo.bar ?? \"qux\") {}
+function bar(bar, qux = bar ?? \"qux\") {}
+function foo2(opts) {
+  var value = opts.foo ?? \"default\";
+}
+function foo3(foo, bar = foo ?? \"bar\") {}
+function foo4() {
+  var value = this ?? {};
+}
+",
+        );
+    }
+
+    #[test]
     fn leaves_mismatched_guards_unchanged() {
         define_ast_inline_test(transform_ast)(
             "
