@@ -7,7 +7,7 @@ use oxc_ast::{
         BindingIdentifier, BindingPattern, CallExpression, Expression, IdentifierReference,
         JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElementName,
         JSXExpression, JSXMemberExpressionObject, ObjectPropertyKind, PropertyKey, Statement,
-        VariableDeclarationKind, VariableDeclarator,
+        TemplateLiteral, VariableDeclarationKind, VariableDeclarator,
     },
     AstBuilder,
 };
@@ -408,19 +408,11 @@ impl<'a> JsxTransformer<'a> {
     fn to_jsx_tag(&mut self, expression: Expression<'a>) -> Option<JSXElementName<'a>> {
         match expression {
             Expression::StringLiteral(literal) => {
-                if let Some((namespace, name)) = literal.value.as_str().split_once(':') {
-                    let namespace = self.ast.jsx_identifier(literal.span, namespace);
-                    let name = self.ast.jsx_identifier(literal.span, name);
-                    return Some(self.ast.jsx_element_name_namespaced_name(
-                        literal.span,
-                        namespace,
-                        name,
-                    ));
-                }
-                Some(
-                    self.ast
-                        .jsx_element_name_identifier(literal.span, literal.value.as_str()),
-                )
+                Some(self.jsx_tag_from_static_string(literal.span, literal.value.as_str()))
+            }
+            Expression::TemplateLiteral(literal) => {
+                let tag_name = static_template_literal_value(&literal)?;
+                Some(self.jsx_tag_from_static_string(literal.span, tag_name))
             }
             Expression::Identifier(identifier) => {
                 if let Some(tag_name) = self
@@ -454,6 +446,19 @@ impl<'a> JsxTransformer<'a> {
             }
             _ => None,
         }
+    }
+
+    fn jsx_tag_from_static_string(&self, span: Span, tag_name: &str) -> JSXElementName<'a> {
+        if let Some((namespace, name)) = tag_name.split_once(':') {
+            let namespace = self.ast.jsx_identifier(span, self.ast.str(namespace));
+            let name = self.ast.jsx_identifier(span, self.ast.str(name));
+            return self
+                .ast
+                .jsx_element_name_namespaced_name(span, namespace, name);
+        }
+
+        self.ast
+            .jsx_element_name_identifier(span, self.ast.str(tag_name))
     }
 
     fn dynamic_component_tag(
@@ -866,11 +871,20 @@ fn string_tag_declaration<'a>(statement: &'a Statement<'a>) -> Option<(&'a str, 
     let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
         return None;
     };
-    let Some(Expression::StringLiteral(value)) = &declarator.init else {
+    let Some(init) = &declarator.init else {
         return None;
     };
+    let value = match init {
+        Expression::StringLiteral(value) => value.value.as_str(),
+        Expression::TemplateLiteral(value) => static_template_literal_value(value)?,
+        _ => return None,
+    };
 
-    Some((identifier.name.as_str(), value.value.as_str()))
+    Some((identifier.name.as_str(), value))
+}
+
+fn static_template_literal_value<'a>(literal: &'a TemplateLiteral<'a>) -> Option<&'a str> {
+    literal.single_quasi().map(|value| value.as_str())
 }
 
 fn removable_used_string_tag_declaration(
@@ -1506,6 +1520,28 @@ function fn() {
 function fn() {
   return <div />;
 }
+"#,
+        );
+    }
+
+    #[test]
+    fn inlines_constant_template_string_tags() {
+        define_ast_inline_test(transform_ast)(
+            r#"
+function fn() {
+  const Name = `div`;
+  return React.createElement(Name, null);
+}
+b = _jsxs(`div`, {
+  className: `flex flex-wrap items-center justify-center gap-3`,
+  children: [v, y]
+});
+"#,
+            r#"
+function fn() {
+  return <div />;
+}
+b = <div className={`flex flex-wrap items-center justify-center gap-3`}>{v}{y}</div>;
 "#,
         );
     }

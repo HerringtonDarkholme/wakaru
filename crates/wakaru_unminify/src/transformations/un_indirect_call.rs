@@ -250,9 +250,10 @@ impl ImportState {
     }
 
     fn generate_name(&mut self, base: &str) -> String {
-        if !self.occupied_names.contains(base) {
-            self.occupied_names.insert(base.to_string());
-            return base.to_string();
+        let base = binding_name_base(base);
+        if !self.occupied_names.contains(&base) {
+            self.occupied_names.insert(base.clone());
+            return base;
         }
 
         let mut index = 1;
@@ -994,6 +995,88 @@ fn imported_name<'a>(imported: &'a oxc_ast::ast::ModuleExportName<'a>) -> Option
     }
 }
 
+fn binding_name_base(name: &str) -> String {
+    if is_valid_binding_identifier(name) {
+        return name.to_string();
+    }
+
+    let mut base = String::with_capacity(name.len() + 1);
+    base.push('_');
+    for ch in name.chars() {
+        if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+            base.push(ch);
+        } else {
+            base.push('_');
+        }
+    }
+
+    if is_valid_binding_identifier(&base) {
+        base
+    } else {
+        "_binding".to_string()
+    }
+}
+
+fn is_valid_binding_identifier(name: &str) -> bool {
+    if is_reserved_identifier(name) {
+        return false;
+    }
+
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+fn is_reserved_identifier(name: &str) -> bool {
+    matches!(
+        name,
+        "arguments"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
 fn is_require_call(expression: &Expression) -> bool {
     let Expression::CallExpression(call) = without_parentheses(expression) else {
         return false;
@@ -1147,6 +1230,21 @@ i = jsx(Z.Suspense, {
     }
 
     #[test]
+    fn aliases_reserved_named_imports() {
+        define_ast_inline_test(transform_ast)(
+            "
+import runtime from \"runtime\";
+
+(0, runtime.default)();
+",
+            "
+import { default as _default } from \"runtime\";
+_default();
+",
+        );
+    }
+
+    #[test]
     fn keeps_namespace_import_when_other_references_remain() {
         define_ast_inline_test(transform_ast)(
             "
@@ -1166,6 +1264,22 @@ i = jsx(Z.Suspense, {
   fallback: children,
   children: r
 });
+",
+        );
+    }
+
+    #[test]
+    fn aliases_reserved_require_properties() {
+        define_ast_inline_test(transform_ast)(
+            "
+const runtime = require(\"runtime\");
+
+(0, runtime.default)();
+",
+            "
+const runtime = require(\"runtime\");
+const { default: _default } = runtime;
+_default();
 ",
         );
     }
@@ -1214,6 +1328,22 @@ const { render: render_1 } = namespace;
 function render() {
   return render_1(value);
 }
+",
+        );
+    }
+
+    #[test]
+    fn aliases_reserved_local_object_properties() {
+        define_ast_inline_test(transform_ast)(
+            "
+const namespace = getNamespace();
+
+(0, namespace.default)();
+",
+            "
+const namespace = getNamespace();
+const { default: _default } = namespace;
+_default();
 ",
         );
     }
