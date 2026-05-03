@@ -77,11 +77,12 @@ impl<'a> OptionalChainingTransformer<'a> {
         let Expression::LogicalExpression(logical) = expression else {
             return None;
         };
-        if logical.operator != LogicalOperator::Or {
-            return None;
-        }
 
-        let guard = optional_or_guard(&logical.left)?;
+        let guard = match logical.operator {
+            LogicalOperator::Or => optional_or_guard(&logical.left)?,
+            LogicalOperator::And => optional_and_guard(&logical.left)?,
+            _ => return None,
+        };
         let replacement = self.optional_chain_expression(
             logical.span,
             guard.target,
@@ -505,6 +506,39 @@ fn optional_or_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalO
     None
 }
 
+fn optional_and_guard<'a, 'b>(expression: &'b Expression<'a>) -> Option<OptionalOrGuard<'a, 'b>> {
+    let Expression::LogicalExpression(logical) = without_parentheses(expression) else {
+        return None;
+    };
+    if logical.operator != LogicalOperator::And {
+        return None;
+    }
+
+    if let Some((temp_name, target)) = assignment_not_null_check(without_parentheses(&logical.left))
+    {
+        if identifier_not_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: Some(temp_name),
+            });
+        }
+    }
+
+    if let Some((temp_name, target)) = identifier_not_null_check(without_parentheses(&logical.left))
+    {
+        if identifier_not_nullish_check(without_parentheses(&logical.right), temp_name) {
+            return Some(OptionalOrGuard {
+                temp_name,
+                target,
+                unused_temp: None,
+            });
+        }
+    }
+
+    None
+}
+
 fn identifier_null_check<'a, 'b>(
     expression: &'b Expression<'a>,
 ) -> Option<(&'b str, &'b Expression<'a>)> {
@@ -512,6 +546,35 @@ fn identifier_null_check<'a, 'b>(
         return None;
     };
     if !is_equality_operator(binary.operator) {
+        return None;
+    }
+
+    if matches!(
+        without_parentheses(&binary.right),
+        Expression::NullLiteral(_)
+    ) {
+        let name = identifier_name(&binary.left)?;
+        return Some((name, without_parentheses(&binary.left)));
+    }
+
+    if matches!(
+        without_parentheses(&binary.left),
+        Expression::NullLiteral(_)
+    ) {
+        let name = identifier_name(&binary.right)?;
+        return Some((name, without_parentheses(&binary.right)));
+    }
+
+    None
+}
+
+fn identifier_not_null_check<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<(&'b str, &'b Expression<'a>)> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_inequality_operator(binary.operator) {
         return None;
     }
 
@@ -609,6 +672,22 @@ fn assignment_null_check<'a, 'b>(
     assignment_compared_to_null(&binary.right, &binary.left)
 }
 
+fn assignment_not_null_check<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<(&'b str, &'b Expression<'a>)> {
+    let Expression::BinaryExpression(binary) = expression else {
+        return None;
+    };
+    if !is_inequality_operator(binary.operator) {
+        return None;
+    }
+
+    if let Some(result) = assignment_compared_to_null(&binary.left, &binary.right) {
+        return Some(result);
+    }
+    assignment_compared_to_null(&binary.right, &binary.left)
+}
+
 fn assignment_compared_to_null<'a, 'b>(
     maybe_assignment: &'b Expression<'a>,
     maybe_null: &Expression<'a>,
@@ -649,6 +728,18 @@ fn identifier_nullish_check(expression: &Expression, name: &str) -> bool {
         || (identifier_name(&binary.right) == Some(name) && is_undefined_expression(&binary.left))
 }
 
+fn identifier_not_nullish_check(expression: &Expression, name: &str) -> bool {
+    let Expression::BinaryExpression(binary) = expression else {
+        return false;
+    };
+    if !is_inequality_operator(binary.operator) {
+        return false;
+    }
+
+    (identifier_name(&binary.left) == Some(name) && is_undefined_expression(&binary.right))
+        || (identifier_name(&binary.right) == Some(name) && is_undefined_expression(&binary.left))
+}
+
 fn identifier_name<'a>(expression: &'a Expression) -> Option<&'a str> {
     let Expression::Identifier(identifier) = without_parentheses(expression) else {
         return None;
@@ -661,6 +752,13 @@ fn is_equality_operator(operator: BinaryOperator) -> bool {
     matches!(
         operator,
         BinaryOperator::Equality | BinaryOperator::StrictEquality
+    )
+}
+
+fn is_inequality_operator(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Inequality | BinaryOperator::StrictInequality
     )
 }
 
@@ -831,6 +929,25 @@ var _foo, _bar;
 ",
             "
 foo?.(bar);
+foo.bar?.(baz);
+",
+        );
+    }
+
+    #[test]
+    fn restores_logical_and_truthy_guards() {
+        define_ast_inline_test(transform_ast)(
+            "
+var _foo, _bar, _baz;
+foo !== null && foo !== void 0 && foo.bar;
+(_foo = foo) !== null && _foo !== void 0 && _foo.bar;
+(_bar = foo) !== null && _bar !== void 0 && _bar(baz);
+(_baz = foo.bar) !== null && _baz !== void 0 && _baz.call(foo, baz);
+",
+            "
+foo?.bar;
+foo?.bar;
+foo?.(baz);
 foo.bar?.(baz);
 ",
         );
