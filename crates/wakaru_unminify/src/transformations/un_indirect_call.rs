@@ -5,11 +5,11 @@ use oxc_ast::{
     ast::{
         Argument, BindingPattern, BindingProperty, CallExpression, Expression, ImportDeclaration,
         ImportDeclarationSpecifier, ImportOrExportKind, PropertyKey, Statement,
-        VariableDeclaration, VariableDeclarationKind,
+        VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
     },
     AstBuilder,
 };
-use oxc_ast_visit::{walk_mut, VisitMut};
+use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
 use oxc_span::Span;
 use wakaru_core::diagnostics::Result;
@@ -42,11 +42,13 @@ pub fn transform_ast(source: &mut ParsedSourceFile) -> Result<()> {
 #[derive(Default)]
 struct ImportState {
     default_imports: HashMap<SymbolId, DefaultImport>,
+    namespace_imports: HashMap<SymbolId, NamespaceImport>,
     named_imports: HashMap<(String, String), String>,
     additions: HashMap<String, Vec<NamedImportAddition>>,
     addition_keys: HashSet<(String, String, String)>,
     occupied_names: HashSet<String>,
     replaced_default_refs: HashMap<SymbolId, usize>,
+    replaced_namespace_refs: HashMap<SymbolId, usize>,
     replacement_cache: HashMap<(SymbolId, String), String>,
     require_bindings: HashMap<SymbolId, RequireBinding>,
     require_binding_order: Vec<SymbolId>,
@@ -54,9 +56,17 @@ struct ImportState {
     require_destructure_additions: HashMap<(usize, usize), Vec<RequirePropertyAddition>>,
     require_insertions: HashMap<SymbolId, RequireDestructureInsertion>,
     require_replacement_cache: HashMap<(SymbolId, String), String>,
+    local_bindings: HashMap<SymbolId, LocalNamespaceBinding>,
+    local_destructures: Vec<LocalDestructure>,
+    local_insertions: HashMap<SymbolId, LocalDestructureInsertion>,
+    local_replacement_cache: HashMap<(SymbolId, String), String>,
 }
 
 struct DefaultImport {
+    source: String,
+}
+
+struct NamespaceImport {
     source: String,
 }
 
@@ -90,6 +100,22 @@ struct RequireDestructureInsertion {
     properties: Vec<RequirePropertyAddition>,
 }
 
+struct LocalNamespaceBinding {
+    local: String,
+    span: Span,
+}
+
+struct LocalDestructure {
+    symbol_id: SymbolId,
+    span: Span,
+    properties: HashMap<String, String>,
+}
+
+struct LocalDestructureInsertion {
+    object_local: String,
+    properties: Vec<RequirePropertyAddition>,
+}
+
 impl ImportState {
     fn from_program(program: &oxc_ast::ast::Program, scoping: &Scoping) -> Self {
         let mut state = Self {
@@ -104,6 +130,13 @@ impl ImportState {
 
             state.collect_import(import);
         }
+
+        let mut local_collector = LocalNamespaceCollector {
+            scoping,
+            local_bindings: &mut state.local_bindings,
+            local_destructures: &mut state.local_destructures,
+        };
+        local_collector.visit_program(program);
 
         for (statement_index, statement) in program.body.iter().enumerate() {
             let Statement::VariableDeclaration(declaration) = statement else {
@@ -156,6 +189,14 @@ impl ImportState {
                         .insert(named.local.name.as_str().to_string());
                 }
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
+                    if let Some(symbol_id) = namespace.local.symbol_id.get() {
+                        self.namespace_imports.insert(
+                            symbol_id,
+                            NamespaceImport {
+                                source: source.clone(),
+                            },
+                        );
+                    }
                     self.occupied_names
                         .insert(namespace.local.name.as_str().to_string());
                 }
@@ -229,9 +270,22 @@ impl ImportState {
         *self.replaced_default_refs.entry(symbol_id).or_default() += 1;
     }
 
+    fn record_replaced_namespace_ref(&mut self, symbol_id: SymbolId) {
+        *self.replaced_namespace_refs.entry(symbol_id).or_default() += 1;
+    }
+
     fn default_can_be_removed(&self, symbol_id: SymbolId, scoping: &Scoping) -> bool {
         let replaced = self
             .replaced_default_refs
+            .get(&symbol_id)
+            .copied()
+            .unwrap_or(0);
+        replaced > 0 && replaced == scoping.get_resolved_reference_ids(symbol_id).len()
+    }
+
+    fn namespace_can_be_removed(&self, symbol_id: SymbolId, scoping: &Scoping) -> bool {
+        let replaced = self
+            .replaced_namespace_refs
             .get(&symbol_id)
             .copied()
             .unwrap_or(0);
@@ -397,6 +451,133 @@ impl ImportState {
             .get(&symbol_id)
             .is_some_and(|binding| span.start > binding.span.end && span.end < call_span.start)
     }
+
+    fn local_for_local_property(
+        &mut self,
+        symbol_id: SymbolId,
+        imported: &str,
+        call_span: Span,
+    ) -> Option<String> {
+        let cache_key = (symbol_id, imported.to_string());
+        if let Some(local) = self.local_replacement_cache.get(&cache_key) {
+            return Some(local.clone());
+        }
+
+        if let Some(local) = self.existing_local_property_local(symbol_id, imported, call_span) {
+            self.local_replacement_cache
+                .insert(cache_key, local.clone());
+            return Some(local);
+        }
+
+        let local = self.generate_name(imported);
+        let addition = RequirePropertyAddition {
+            imported: imported.to_string(),
+            local: local.clone(),
+        };
+        let binding = self.local_bindings.get(&symbol_id)?;
+        self.local_insertions
+            .entry(symbol_id)
+            .or_insert_with(|| LocalDestructureInsertion {
+                object_local: binding.local.clone(),
+                properties: Vec::new(),
+            })
+            .properties
+            .push(addition);
+
+        self.local_replacement_cache
+            .insert(cache_key, local.clone());
+        Some(local)
+    }
+
+    fn existing_local_property_local(
+        &self,
+        symbol_id: SymbolId,
+        imported: &str,
+        call_span: Span,
+    ) -> Option<String> {
+        self.local_destructures
+            .iter()
+            .filter(|destructure| {
+                destructure.symbol_id == symbol_id
+                    && self.is_between_local_and_call(destructure.span, symbol_id, call_span)
+            })
+            .find_map(|destructure| destructure.properties.get(imported).cloned())
+    }
+
+    fn is_between_local_and_call(&self, span: Span, symbol_id: SymbolId, call_span: Span) -> bool {
+        self.local_bindings
+            .get(&symbol_id)
+            .is_some_and(|binding| span.start > binding.span.end && span.end < call_span.start)
+    }
+}
+
+struct LocalNamespaceCollector<'s, 'f, 'd> {
+    scoping: &'s Scoping,
+    local_bindings: &'f mut HashMap<SymbolId, LocalNamespaceBinding>,
+    local_destructures: &'d mut Vec<LocalDestructure>,
+}
+
+impl<'a> Visit<'a> for LocalNamespaceCollector<'_, '_, '_> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        self.collect_local_binding(declarator);
+        self.collect_local_destructure(declarator);
+        walk::walk_variable_declarator(self, declarator);
+    }
+}
+
+impl LocalNamespaceCollector<'_, '_, '_> {
+    fn collect_local_binding(&mut self, declarator: &VariableDeclarator) {
+        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+            return;
+        };
+        if declarator.init.is_none() {
+            return;
+        }
+        let Some(symbol_id) = identifier.symbol_id.get() else {
+            return;
+        };
+
+        self.local_bindings.insert(
+            symbol_id,
+            LocalNamespaceBinding {
+                local: identifier.name.as_str().to_string(),
+                span: declarator.span,
+            },
+        );
+    }
+
+    fn collect_local_destructure(&mut self, declarator: &VariableDeclarator) {
+        let BindingPattern::ObjectPattern(pattern) = &declarator.id else {
+            return;
+        };
+        let Some(Expression::Identifier(init)) = &declarator.init else {
+            return;
+        };
+        let Some(symbol_id) = init
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        else {
+            return;
+        };
+        if !self.local_bindings.contains_key(&symbol_id) {
+            return;
+        }
+
+        let mut properties = HashMap::new();
+        for property in &pattern.properties {
+            let Some((imported, local)) = binding_property_names(property) else {
+                continue;
+            };
+            properties.insert(imported.to_string(), local.to_string());
+        }
+
+        self.local_destructures.push(LocalDestructure {
+            symbol_id,
+            span: declarator.span,
+            properties,
+        });
+    }
 }
 
 struct IndirectCallReplacer<'a, 's, 'i> {
@@ -420,11 +601,17 @@ impl<'a> VisitMut<'a> for IndirectCallReplacer<'a, '_, '_> {
                 symbol_id,
                 source,
                 imported,
+                binding,
             } => {
                 let local = self
                     .imports
                     .local_for_named_import(symbol_id, &source, &imported);
-                self.imports.record_replaced_default_ref(symbol_id);
+                match binding {
+                    ImportBinding::Default => self.imports.record_replaced_default_ref(symbol_id),
+                    ImportBinding::Namespace => {
+                        self.imports.record_replaced_namespace_ref(symbol_id)
+                    }
+                }
                 local
             }
             IndirectCallTarget::Require {
@@ -434,6 +621,18 @@ impl<'a> VisitMut<'a> for IndirectCallReplacer<'a, '_, '_> {
                 let Some(local) = self
                     .imports
                     .local_for_required_property(symbol_id, &imported, call.span)
+                else {
+                    return;
+                };
+                local
+            }
+            IndirectCallTarget::Local {
+                symbol_id,
+                imported,
+            } => {
+                let Some(local) = self
+                    .imports
+                    .local_for_local_property(symbol_id, &imported, call.span)
                 else {
                     return;
                 };
@@ -451,11 +650,21 @@ enum IndirectCallTarget {
         symbol_id: SymbolId,
         source: String,
         imported: String,
+        binding: ImportBinding,
     },
     Require {
         symbol_id: SymbolId,
         imported: String,
     },
+    Local {
+        symbol_id: SymbolId,
+        imported: String,
+    },
+}
+
+enum ImportBinding {
+    Default,
+    Namespace,
 }
 
 fn indirect_import_call_target(
@@ -488,6 +697,16 @@ fn indirect_import_call_target(
             symbol_id,
             source: default_import.source.clone(),
             imported: member.property.name.as_str().to_string(),
+            binding: ImportBinding::Default,
+        });
+    }
+
+    if let Some(namespace_import) = imports.namespace_imports.get(&symbol_id) {
+        return Some(IndirectCallTarget::Import {
+            symbol_id,
+            source: namespace_import.source.clone(),
+            imported: member.property.name.as_str().to_string(),
+            binding: ImportBinding::Namespace,
         });
     }
 
@@ -497,6 +716,17 @@ fn indirect_import_call_target(
         .is_some_and(|binding| call_span.start > binding.span.end)
     {
         return Some(IndirectCallTarget::Require {
+            symbol_id,
+            imported: member.property.name.as_str().to_string(),
+        });
+    }
+
+    if imports
+        .local_bindings
+        .get(&symbol_id)
+        .is_some_and(|binding| call_span.start > binding.span.end)
+    {
+        return Some(IndirectCallTarget::Local {
             symbol_id,
             imported: member.property.name.as_str().to_string(),
         });
@@ -526,42 +756,70 @@ struct ImportRewriter<'a, 's> {
 
 impl<'a> ImportRewriter<'a, '_> {
     fn transform_program(&mut self, program: &mut oxc_ast::ast::Program<'a>) {
-        let old_body = program.body.take_in(self.ast);
+        self.transform_statement_list(&mut program.body, true);
+    }
+
+    fn transform_statement_list(
+        &mut self,
+        statements: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+        is_program_body: bool,
+    ) {
+        let old_body = statements.take_in(self.ast);
         let mut new_body = self.ast.vec_with_capacity(old_body.len());
 
         for (statement_index, statement) in old_body.into_iter().enumerate() {
-            let mut keep_statement = true;
             match statement {
-                oxc_ast::ast::Statement::ImportDeclaration(mut import) => {
-                    if self.rewrite_import_declaration(&mut import) {
+                oxc_ast::ast::Statement::ImportDeclaration(mut import) if is_program_body => {
+                    let extra_import = self.rewrite_import_declaration(&mut import);
+                    if !import
+                        .specifiers
+                        .as_ref()
+                        .is_some_and(|specifiers| specifiers.is_empty())
+                    {
                         new_body.push(oxc_ast::ast::Statement::ImportDeclaration(import));
                     }
-                    keep_statement = false;
+                    if let Some(extra_import) = extra_import {
+                        new_body.push(extra_import);
+                    }
                 }
                 oxc_ast::ast::Statement::VariableDeclaration(mut declaration) => {
-                    self.rewrite_require_destructuring(statement_index, &mut declaration);
-                    new_body.push(oxc_ast::ast::Statement::VariableDeclaration(declaration));
+                    if is_program_body {
+                        self.rewrite_require_destructuring(statement_index, &mut declaration);
+                    }
+                    let mut statement = oxc_ast::ast::Statement::VariableDeclaration(declaration);
+                    walk_mut::walk_statement(self, &mut statement);
+                    let local_symbols = local_binding_symbol_ids(&statement);
+                    new_body.push(statement);
+                    self.push_local_insertions(local_symbols, &mut new_body);
+                    if is_program_body {
+                        self.push_require_insertions(statement_index, &mut new_body);
+                    }
                 }
-                statement => new_body.push(statement),
-            }
-
-            if keep_statement {
-                self.push_require_insertions(statement_index, &mut new_body);
+                mut statement => {
+                    walk_mut::walk_statement(self, &mut statement);
+                    new_body.push(statement);
+                    if is_program_body {
+                        self.push_require_insertions(statement_index, &mut new_body);
+                    }
+                }
             }
         }
 
-        program.body = new_body;
+        *statements = new_body;
     }
 
-    fn rewrite_import_declaration(&mut self, import: &mut ImportDeclaration<'a>) -> bool {
+    fn rewrite_import_declaration(
+        &mut self,
+        import: &mut ImportDeclaration<'a>,
+    ) -> Option<Statement<'a>> {
         let source = import.source.value.as_str().to_string();
         let additions = self.imports.additions.remove(&source).unwrap_or_default();
         let Some(specifiers) = &mut import.specifiers else {
-            return true;
+            return None;
         };
 
         specifiers.retain(|specifier| {
-            !matches!(
+            let removable_default = matches!(
                 specifier,
                 ImportDeclarationSpecifier::ImportDefaultSpecifier(default)
                     if default
@@ -569,7 +827,18 @@ impl<'a> ImportRewriter<'a, '_> {
                         .symbol_id
                         .get()
                         .is_some_and(|symbol_id| self.imports.default_can_be_removed(symbol_id, self.scoping))
-            )
+            );
+            let removable_namespace = matches!(
+                specifier,
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace)
+                    if namespace
+                        .local
+                        .symbol_id
+                        .get()
+                        .is_some_and(|symbol_id| self.imports.namespace_can_be_removed(symbol_id, self.scoping))
+            );
+
+            !(removable_default || removable_namespace)
         });
 
         if specifiers.iter().any(|specifier| {
@@ -578,7 +847,8 @@ impl<'a> ImportRewriter<'a, '_> {
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(_)
             )
         }) {
-            return !specifiers.is_empty();
+            return (!additions.is_empty())
+                .then(|| named_import_statement(self.ast, &source, additions));
         }
 
         for addition in additions {
@@ -589,7 +859,7 @@ impl<'a> ImportRewriter<'a, '_> {
             ));
         }
 
-        !specifiers.is_empty()
+        None
     }
 
     fn rewrite_require_destructuring(
@@ -642,6 +912,29 @@ impl<'a> ImportRewriter<'a, '_> {
             ));
         }
     }
+
+    fn push_local_insertions(
+        &mut self,
+        symbol_ids: Vec<SymbolId>,
+        new_body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+    ) {
+        for symbol_id in symbol_ids {
+            let Some(insertion) = self.imports.local_insertions.remove(&symbol_id) else {
+                continue;
+            };
+            new_body.push(require_destructure_statement(
+                self.ast,
+                &insertion.object_local,
+                insertion.properties,
+            ));
+        }
+    }
+}
+
+impl<'a> VisitMut<'a> for ImportRewriter<'a, '_> {
+    fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        self.transform_statement_list(statements, false);
+    }
 }
 
 fn named_import_specifier<'a>(
@@ -655,6 +948,30 @@ fn named_import_specifier<'a>(
         ast.binding_identifier(Span::default(), ast.ident(local)),
         ImportOrExportKind::Value,
     )
+}
+
+fn named_import_statement<'a>(
+    ast: AstBuilder<'a>,
+    source: &str,
+    additions: Vec<NamedImportAddition>,
+) -> Statement<'a> {
+    let mut specifiers = ast.vec_with_capacity(additions.len());
+    for addition in additions {
+        specifiers.push(named_import_specifier(
+            ast,
+            &addition.imported,
+            &addition.local,
+        ));
+    }
+
+    Statement::ImportDeclaration(ast.alloc_import_declaration(
+        Span::default(),
+        Some(specifiers),
+        ast.string_literal(Span::default(), ast.str(source), None),
+        None,
+        None::<oxc_allocator::Box<'a, oxc_ast::ast::WithClause<'a>>>,
+        ImportOrExportKind::Value,
+    ))
 }
 
 fn collect_all_names(scoping: &Scoping) -> HashSet<String> {
@@ -703,6 +1020,23 @@ fn binding_property_names<'a>(property: &'a BindingProperty<'a>) -> Option<(&'a 
     };
 
     Some((key.name.as_str(), value.name.as_str()))
+}
+
+fn local_binding_symbol_ids(statement: &Statement) -> Vec<SymbolId> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return Vec::new();
+    };
+
+    declaration
+        .declarations
+        .iter()
+        .filter_map(|declarator| {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                return None;
+            };
+            identifier.symbol_id.get()
+        })
+        .collect()
 }
 
 fn require_destructure_statement<'a>(
@@ -787,6 +1121,128 @@ var countRef = (0, s.useRef)(0);
             "
 import { useRef } from \"react\";
 var countRef = useRef(0);
+",
+        );
+    }
+
+    #[test]
+    fn converts_indirect_calls_from_namespace_imports() {
+        define_ast_inline_test(transform_ast)(
+            "
+import * as $ from \"react/jsx-runtime\";
+
+i = (0, $.jsx)(Z.Suspense, {
+  fallback: children,
+  children: r
+});
+",
+            "
+import { jsx } from \"react/jsx-runtime\";
+i = jsx(Z.Suspense, {
+  fallback: children,
+  children: r
+});
+",
+        );
+    }
+
+    #[test]
+    fn keeps_namespace_import_when_other_references_remain() {
+        define_ast_inline_test(transform_ast)(
+            "
+import * as $ from \"react/jsx-runtime\";
+
+console.log($);
+i = (0, $.jsx)(Z.Suspense, {
+  fallback: children,
+  children: r
+});
+",
+            "
+import * as $ from \"react/jsx-runtime\";
+import { jsx } from \"react/jsx-runtime\";
+console.log($);
+i = jsx(Z.Suspense, {
+  fallback: children,
+  children: r
+});
+",
+        );
+    }
+
+    #[test]
+    fn converts_indirect_calls_from_factory_created_namespaces() {
+        define_ast_inline_test(transform_ast)(
+            "
+import { t as t_7 } from \"./jsx-runtime-ebkFq_df.js\";
+
+function render() {
+  var $ = t_7();
+  return (0, $.jsx)(C_7.Provider, {
+    value: r,
+    children
+  });
+}
+",
+            "
+import { t as t_7 } from \"./jsx-runtime-ebkFq_df.js\";
+function render() {
+  var $ = t_7();
+  const { jsx } = $;
+  return jsx(C_7.Provider, {
+    value: r,
+    children
+  });
+}
+",
+        );
+    }
+
+    #[test]
+    fn converts_indirect_calls_from_local_object_bindings() {
+        define_ast_inline_test(transform_ast)(
+            "
+const namespace = getNamespace();
+
+function render() {
+  return (0, namespace.render)(value);
+}
+",
+            "
+const namespace = getNamespace();
+const { render: render_1 } = namespace;
+function render() {
+  return render_1(value);
+}
+",
+        );
+    }
+
+    #[test]
+    fn reuses_existing_factory_namespace_destructuring() {
+        define_ast_inline_test(transform_ast)(
+            "
+import { t as t_7 } from \"./jsx-runtime-ebkFq_df.js\";
+
+function render() {
+  var $ = t_7();
+  const { jsx: runtimeJsx } = $;
+  return (0, $.jsx)(C_7.Provider, {
+    value: r,
+    children
+  });
+}
+",
+            "
+import { t as t_7 } from \"./jsx-runtime-ebkFq_df.js\";
+function render() {
+  var $ = t_7();
+  const { jsx: runtimeJsx } = $;
+  return runtimeJsx(C_7.Provider, {
+    value: r,
+    children
+  });
+}
 ",
         );
     }

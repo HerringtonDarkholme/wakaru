@@ -187,6 +187,51 @@ mod tests {
     }
 
     #[test]
+    fn restores_jsx_from_indirect_namespace_runtime_call() {
+        let source = SourceFile::from_parts(
+            PathBuf::from("input.js"),
+            r#"import * as $ from "react/jsx-runtime";
+i = (0, $.jsx)(Z.Suspense, {
+  fallback: children,
+  children: r
+});
+"#,
+        );
+
+        let result = run_default_transformations(&source, PipelineParams::default())
+            .expect("pipeline should succeed");
+
+        assert_eq!(
+            result.code,
+            "import { jsx } from \"react/jsx-runtime\";\ni = <Z.Suspense fallback={children}>{r}</Z.Suspense>;\n"
+        );
+    }
+
+    #[test]
+    fn restores_jsx_from_factory_created_runtime_namespace() {
+        let source = SourceFile::from_parts(
+            PathBuf::from("input.js"),
+            r#"import { t as t_7 } from "./jsx-runtime-ebkFq_df.js";
+function render() {
+  var $ = t_7();
+  return (0, $.jsx)(C_7.Provider, {
+    value: r,
+    children
+  });
+}
+"#,
+        );
+
+        let result = run_default_transformations(&source, PipelineParams::default())
+            .expect("pipeline should succeed");
+
+        assert_eq!(
+            result.code,
+            "import { t } from \"./jsx-runtime-ebkFq_df.js\";\nfunction render() {\n  var $ = t();\n  const { jsx } = $;\n  return <C_7.Provider value={r}>{children}</C_7.Provider>;\n}\n"
+        );
+    }
+
+    #[test]
     fn preserves_numeric_literal_raw_comments_across_formatting_boundaries() {
         let source =
             SourceFile::from_parts(PathBuf::from("input.js"), "0b101010;-0x123;4.2e2;-2e4;");
